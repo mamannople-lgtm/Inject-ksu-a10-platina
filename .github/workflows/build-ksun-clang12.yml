@@ -168,21 +168,84 @@ jobs:
           echo "$TC_BIN" >> "$GITHUB_PATH"
           echo "Clang 12 ready: $TC_BIN"
 
-      - name: Clone Android GCC 4.9 toolchains
+      - name: Download Android GCC 4.9 toolchains (LineageOS with AOSP fallback)
         shell: bash
         run: |
-          set -euo pipefail
-          git clone --depth=1 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
-            toolchains/gcc64
-          git clone --depth=1 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
-            toolchains/gcc32
-          test -x toolchains/gcc64/bin/aarch64-linux-android-as
-          test -x toolchains/gcc64/bin/aarch64-linux-android-elfedit
-          test -x toolchains/gcc32/bin/arm-linux-androideabi-gcc
+          set -Eeuo pipefail
+          mkdir -p toolchains build-logs
+          exec > >(tee build-logs/gcc-download.log) 2>&1
+
+          # AOSP main no longer necessarily contains the old GCC binaries.
+          # LineageOS lineage-19.1 and Android 10 r40 retain GCC 4.9 prebuilts.
+          fetch_gcc() {
+            local arch="$1" dest="$2" required="$3" lineage_repo="$4" aosp_repo="$5"
+            local source url ref attempt
+
+            for source in LineageOS AOSP; do
+              if [[ "$source" == LineageOS ]]; then
+                url="https://github.com/LineageOS/${lineage_repo}.git"
+                ref="lineage-19.1"
+              else
+                url="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/${aosp_repo}"
+                ref="android-10.0.0_r40"
+              fi
+
+              for attempt in 1 2; do
+                echo "=== [$arch] $source attempt $attempt: $url (ref $ref) ==="
+                rm -rf "$dest"
+                # Ensure git failures (network, HTTP, missing branch) are
+                # included in gcc-download.log and do not hide the fallback.
+                if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 \
+                    clone --depth=1 --single-branch --branch "$ref" \
+                    "$url" "$dest"; then
+                  if [[ -x "$dest/bin/$required" ]]; then
+                    echo "[OK] $arch $required is present and executable"
+                    git -C "$dest" rev-parse HEAD
+                    return 0
+                  else
+                    echo "::warning::$source clone for $arch completed, but bin/$required is missing"
+                    ls -la "$dest/bin/" 2>/dev/null | head -30 || true
+                  fi
+                else
+                  echo "::warning::$source clone failed for $arch (attempt $attempt)"
+                fi
+              done
+            done
+
+            echo "::error::Android GCC 4.9 $arch could not be fetched. See build-logs/gcc-download.log"
+            rm -rf "$dest"
+            return 1
+          }
+
+          fetch_gcc arm64 toolchains/gcc64 aarch64-linux-android-as \
+            android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 \
+            aarch64/aarch64-linux-android-4.9
+          fetch_gcc arm32 toolchains/gcc32 arm-linux-androideabi-gcc \
+            android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 \
+            arm/arm-linux-androideabi-4.9
+
+          echo '=== Check GCC 4.9 binaries ==='
+          for tool in \
+            toolchains/gcc64/bin/aarch64-linux-android-as \
+            toolchains/gcc64/bin/aarch64-linux-android-elfedit \
+            toolchains/gcc32/bin/arm-linux-androideabi-gcc; do
+            if [[ ! -x "$tool" ]]; then
+              echo "::error::Missing required tool: $tool"
+              exit 1
+            fi
+            echo "[OK] $tool"
+          done
+          toolchains/gcc32/bin/arm-linux-androideabi-gcc --version | head -1
+          toolchains/gcc64/bin/aarch64-linux-android-as --version | head -1
+          {
+            echo 'GCC64:'
+            git -C toolchains/gcc64 rev-parse HEAD
+            echo 'GCC32:'
+            git -C toolchains/gcc32 rev-parse HEAD
+          } > build-logs/gcc-commits.txt
           echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
+          echo '[OK] Android GCC 4.9 toolchains ready; Clang 12 stays the kernel C compiler'
 
       - name: Integrate KernelSU Next legacy manual hooks
         shell: bash
