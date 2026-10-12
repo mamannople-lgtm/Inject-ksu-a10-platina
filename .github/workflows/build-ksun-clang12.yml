@@ -1,10 +1,30 @@
-name: Platina KernelSU Next - Clang 12
+name: Platina KernelSU Next | Clang 12
 
 on:
   workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'KernelSU Next branch or commit (default: legacy)'
+        required: true
+        default: legacy
+        type: string
+      build_jobs:
+        description: 'Number of parallel jobs (2 recommended for GitHub-hosted runners)'
+        required: true
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
 
 permissions:
   contents: read
+
+concurrency:
+  group: platina-ksun-clang12-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -14,138 +34,365 @@ jobs:
       ARCH: arm64
       SUBARCH: arm64
       KBUILD_BUILD_USER: GitHubActions
-      KBUILD_BUILD_HOST: clang12
+      KBUILD_BUILD_HOST: platina-clang12
       KERNEL_REPO: https://github.com/FirmanBell/msm-4.4.git
       KERNEL_BRANCH: legacy
       DEFCONFIG: platina_defconfig
-      KSU_BRANCH: legacy
-      GCC_REF: android-10.0.0_r41
+      CLANG_URL_FILE: https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-12-link.txt
+      KSU_REF: ${{ inputs.ksu_ref }}
+      BUILD_JOBS: ${{ inputs.build_jobs }}
 
     steps:
-      - name: Checkout workflow and hook script
+      - name: Checkout this repository
         uses: actions/checkout@v4
 
-      - name: Install build prerequisites
+      - name: Prepare CI environment (no external Python scripts required)
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p build-logs dist toolchains
+          echo 'Single-file workflow; scripts/ folder is NOT required.'
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Runner workspace: $GITHUB_WORKSPACE"
+          git rev-parse --short HEAD | tee build-logs/workflow-commit.txt
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates curl flex git \
-            libelf-dev libssl-dev lz4 make python3 rsync unzip zip zlib1g-dev
+            libelf-dev libssl-dev lz4 python3 rsync unzip zip zlib1g-dev
 
-      - name: Fetch platina kernel source (legacy)
+      - name: Checkout FirmanBell legacy kernel
+        shell: bash
         run: |
-          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
-            "$KERNEL_REPO" kernel
+          set -euo pipefail
+          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           test -f "kernel/arch/arm64/configs/$DEFCONFIG"
-          git -C kernel rev-parse HEAD
+          mkdir -p build-logs dist kernel/out
+          git -C kernel rev-parse HEAD | tee build-logs/kernel-commit.txt
 
       - name: Download ZyCromerZ Clang 12.0.1
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p toolchains/clang12
-          curl -fsSL --retry 3 \
-            https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-12-link.txt \
-            -o clang12-url.txt
-          URL="$(tr -d '\r\n' < clang12-url.txt)"
-          case "$URL" in
-            https://github.com/ZyCromerZ/Clang/releases/download/12.*) ;;
-            *) echo "Unexpected Clang 12 URL: $URL"; exit 1 ;;
+          curl --fail --location --silent --show-error --retry 4 "$CLANG_URL_FILE" -o /tmp/clang12-url.txt
+          CLANG_URL="$(tr -d '\r\n' < /tmp/clang12-url.txt)"
+          case "$CLANG_URL" in
+            https://github.com/ZyCromerZ/Clang/releases/download/*/*.tar.gz|https://github.com/ZyCromerZ/Clang/releases/download/*/*.tar.xz|https://github.com/ZyCromerZ/Clang/releases/download/*/*.tar.zst) ;;
+            *) echo "Unexpected Clang 12 download URL: $CLANG_URL" >&2; exit 1 ;;
           esac
-          curl -fL --retry 3 --retry-delay 5 "$URL" -o /tmp/clang12.tar.gz
-          tar -xzf /tmp/clang12.tar.gz -C toolchains/clang12
-          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
-          test -n "$CLANG_BIN" || { echo 'Clang binary missing'; exit 1; }
-          chmod +x "$CLANG_BIN"
-          echo "$(dirname "$CLANG_BIN")" >> "$GITHUB_PATH"
-          "$(dirname "$CLANG_BIN")/clang" --version | head -n 1
-          "$(dirname "$CLANG_BIN")/clang" --version | head -n 1 | grep -E 'version 12\.'
-          test -x "$(dirname "$CLANG_BIN")/ld.lld"
+          echo "Clang archive URL: $CLANG_URL"
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 5 \
+            "$CLANG_URL" -o /tmp/clang12.tar.gz
+          tar -xf /tmp/clang12.tar.gz -C toolchains/clang12
+          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" -type f -path '*/bin/clang' -print -quit)"
+          test -n "$CLANG_BIN"
+          TC_BIN="$(dirname "$CLANG_BIN")"
+          test -x "$TC_BIN/ld.lld"
+          test -x "$TC_BIN/llvm-ar"
+          echo "$TC_BIN" >> "$GITHUB_PATH"
+          "$TC_BIN/clang" --version | head -n1 | tee build-logs/clang-version.txt
+          "$TC_BIN/clang" --version | head -n1 | grep -E 'version 12\.'
 
-      - name: Download Android GCC 4.9 binutils for external assembly
+      - name: Clone Android GCC 4.9 toolchains
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch "$GCC_REF" \
+          git clone --depth=1 \
             https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
             toolchains/gcc64
-          git clone --depth=1 --branch "$GCC_REF" \
+          git clone --depth=1 \
             https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
             toolchains/gcc32
           test -x toolchains/gcc64/bin/aarch64-linux-android-as
           test -x toolchains/gcc64/bin/aarch64-linux-android-elfedit
           test -x toolchains/gcc32/bin/arm-linux-androideabi-gcc
-          # Kernel Makefile forces -no-integrated-as, while clang targets aarch64-linux-gnu.
-          # Supply an assembler under the GNU triple using the Android GCC 4.9 binutils.
-          mkdir -p toolchains/shims
-          ln -s "$GITHUB_WORKSPACE/toolchains/gcc64/bin/aarch64-linux-android-as" \
-            toolchains/shims/aarch64-linux-gnu-as
-          echo "$GITHUB_WORKSPACE/toolchains/shims" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
 
-      - name: Integrate KernelSU Next legacy (manual hooks for 4.4)
+      - name: Integrate KernelSU Next legacy manual hooks
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch "$KSU_BRANCH" \
-            https://github.com/KernelSU-Next/KernelSU-Next.git \
-            kernel/KernelSU-Next
-          ln -s ../KernelSU-Next/kernel kernel/drivers/kernelsu
-          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> kernel/drivers/Makefile
-          sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' kernel/drivers/Kconfig
-          python3 scripts/apply_legacy_hooks.py kernel
+          # 'legacy' is the non-GKI branch. For a SHA, fetch that commit explicitly.
+          if [[ "$KSU_REF" == "legacy" ]]; then
+            git clone --single-branch --branch legacy --depth=1 \
+              https://github.com/KernelSU-Next/KernelSU-Next.git kernel/KernelSU-Next
+          elif [[ "$KSU_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            git clone --filter=blob:none --no-checkout \
+              https://github.com/KernelSU-Next/KernelSU-Next.git kernel/KernelSU-Next
+            git -C kernel/KernelSU-Next checkout "$KSU_REF"
+          else
+            echo "ksu_ref must be legacy or a full 40-digit commit SHA" >&2
+            exit 1
+          fi
+          git -C kernel/KernelSU-Next rev-parse HEAD | tee build-logs/ksu-commit.txt
+          # The following Python sources are EMBEDDED in this workflow to fix
+          # GitHub uploads that omit scripts/apply_legacy_hooks.py.
+          python3 - kernel <<'KSUN_INTEGRATE_PY'
+          #!/usr/bin/env python3
+          """Integrate a checked-out KernelSU Next legacy tree into a Linux kernel.
+          
+          Run from the CI working directory after cloning kernel/KernelSU-Next.
+          Only changes drivers/Kconfig, drivers/Makefile, drivers/kernelsu symlink.
+          """
+          import os
+          from pathlib import Path
+          import sys
+          
+          
+          def integrate(kernel: Path) -> None:
+              kernel = kernel.resolve()
+              drivers = kernel / 'drivers'
+              ksu = kernel / 'KernelSU-Next' / 'kernel'
+              target = drivers / 'kernelsu'
+              mk = drivers / 'Makefile'
+              cfg = drivers / 'Kconfig'
+              for check in (drivers, mk, cfg, ksu / 'Kconfig', ksu / 'Kbuild',
+                            kernel / 'arch/arm64/configs/platina_defconfig'):
+                  if not check.exists():
+                      raise RuntimeError(f'Missing required kernel file: {check}')
+          
+              if target.is_symlink():
+                  if target.resolve() != ksu.resolve():
+                      raise RuntimeError(f'Existing kernelsu link points elsewhere: {target}')
+              elif target.exists():
+                  raise RuntimeError(f'Refusing to overwrite existing kernelsu path: {target}')
+              else:
+                  target.symlink_to(os.path.relpath(ksu, drivers), target_is_directory=True)
+          
+              makeline = 'obj-$(CONFIG_KSU) += kernelsu/'
+              data = mk.read_text()
+              if data.count(makeline) > 1:
+                  raise RuntimeError('drivers/Makefile contains duplicate KernelSU entries')
+              if makeline not in data:
+                  mk.write_text(data.rstrip('\n') + '\n' + makeline + '\n')
+          
+              line = 'source "drivers/kernelsu/Kconfig"'
+              data = cfg.read_text()
+              if data.count(line) > 1:
+                  raise RuntimeError('drivers/Kconfig contains duplicate KernelSU entries')
+              if line not in data:
+                  # Scope to the last *top-level* endmenu, avoiding sed's global insertion.
+                  marker = '\nendmenu'
+                  pos = data.rfind(marker)
+                  if pos == -1:
+                      raise RuntimeError('drivers/Kconfig: closing endmenu not found')
+                  cfg.write_text(data[:pos] + '\n' + line + '\n' + data[pos:])
+              assert mk.read_text().count(makeline) == 1
+              assert cfg.read_text().count(line) == 1
+              print('[OK] KernelSU Next legacy linked exactly once')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  integrate(Path(sys.argv[1] if len(sys.argv) == 2 else 'kernel'))
+              except (RuntimeError, OSError) as e:
+                  print('ERROR:', e, file=sys.stderr)
+                  sys.exit(1)
+          KSUN_INTEGRATE_PY
+          python3 - kernel <<'KSUN_HOOK_PY'
+          #!/usr/bin/env python3
+          """Apply KernelSU-Next legacy manual syscall hooks to FirmanBell/msm-4.4:legacy.
+          
+          Based on the KernelSU Next non-GKI manual hook integration guide.
+          Fails closed when source lines differ from the reviewed kernel revision.
+          """
+          from pathlib import Path
+          import sys
+          
+          
+          def replace_once(path: Path, old: str, new: str) -> None:
+              body = path.read_text()
+              count = body.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{path}: expected one exact anchor, found {count}: {old[:100]!r}")
+              path.write_text(body.replace(old, new, 1))
+              print(f"[OK] patched {path}")
+          
+          
+          def main(root: Path) -> None:
+              if not (root / "arch/arm64/configs/platina_defconfig").is_file():
+                  raise RuntimeError("This script requires a kernel tree with platina_defconfig")
+              targets = ["fs/exec.c", "fs/open.c", "fs/read_write.c", "fs/stat.c", "kernel/reboot.c"]
+              for rel in targets:
+                  if "ksu_handle_" in (root / rel).read_text():
+                      raise RuntimeError(f"{rel} already contains KernelSU hooks: do not inject twice")
+          
+              p = root / "fs/exec.c"
+              replace_once(p, "int do_execve(struct filename *filename,\n",
+                           "#ifdef CONFIG_KSU\n"
+                           "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+                           "\t\t\t      void *argv, void *envp, int *flags);\n"
+                           "#endif\n\n"
+                           "int do_execve(struct filename *filename,\n")
+              replace_once(p,
+                           "\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n"
+                           "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);",
+                           "\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n"
+                           "#ifdef CONFIG_KSU\n"
+                           "\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n"
+                           "#endif\n"
+                           "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);")
+              # After replacing the native call, the remaining identical return is compat_do_execve().
+              replace_once(p,
+                           "\t\t.ptr.compat = __envp,\n\t};\n"
+                           "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);",
+                           "\t\t.ptr.compat = __envp,\n\t};\n"
+                           "#ifdef CONFIG_KSU\n"
+                           "\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n"
+                           "#endif\n"
+                           "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);")
+          
+              p = root / "fs/open.c"
+              replace_once(p,
+                           "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+                           "#ifdef CONFIG_KSU\n"
+                           "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                           "\t\t\t      int *mode, int *flags);\n"
+                           "#endif\n\n"
+                           "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)")
+              replace_once(p,
+                           "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\tif (mode & ~S_IRWXO)",
+                           "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n"
+                           "#ifdef CONFIG_KSU\n"
+                           "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                           "#endif\n"
+                           "\tif (mode & ~S_IRWXO)")
+          
+              p = root / "fs/read_write.c"
+              replace_once(p,
+                           "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)",
+                           "#ifdef CONFIG_KSU\n"
+                           "extern bool ksu_vfs_read_hook __read_mostly;\n"
+                           "extern int ksu_handle_sys_read(unsigned int fd,\n"
+                           "\t\t\t    char __user **buf_ptr, size_t *count_ptr);\n"
+                           "#endif\n\n"
+                           "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)")
+              replace_once(p,
+                           "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n"
+                           "{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;",
+                           "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n"
+                           "{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n"
+                           "#ifdef CONFIG_KSU\n"
+                           "\tif (unlikely(ksu_vfs_read_hook))\n"
+                           "\t\tksu_handle_sys_read(fd, &buf, &count);\n"
+                           "#endif")
+          
+              p = root / "fs/stat.c"
+              replace_once(p,
+                           "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
+                           "#ifdef CONFIG_KSU\n"
+                           "extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
+                           "\t\t\t   int *flags);\n"
+                           "#endif\n\n"
+                           "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,")
+              replace_once(p,
+                           "\t\tstruct stat __user *, statbuf, int, flag)\n"
+                           "{\n\tstruct kstat stat;\n\tint error;\n\n\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+                           "\t\tstruct stat __user *, statbuf, int, flag)\n"
+                           "{\n\tstruct kstat stat;\n\tint error;\n\n"
+                           "#ifdef CONFIG_KSU\n"
+                           "\tksu_handle_stat(&dfd, &filename, &flag);\n"
+                           "#endif\n"
+                           "\terror = vfs_fstatat(dfd, filename, &stat, flag);")
+          
+              p = root / "kernel/reboot.c"
+              replace_once(p,
+                           "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+                           "#ifdef CONFIG_KSU\n"
+                           "extern int ksu_handle_sys_reboot(int magic1, int magic2,\n"
+                           "\t\t\t      unsigned int cmd, void __user **arg);\n"
+                           "#endif\n\n"
+                           "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,")
+              replace_once(p,
+                           "\tchar buffer[256];\n\tint ret = 0;",
+                           "\tchar buffer[256];\n\tint ret = 0;\n"
+                           "#ifdef CONFIG_KSU\n"
+                           "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                           "#endif")
+          
+              for rel in targets:
+                  assert "ksu_handle_" in (root / rel).read_text(), f"Missing manual hook in {rel}"
+              print("[OK] All five KernelSU Next legacy manual hook locations patched")
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main(Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd())
+              except (RuntimeError, OSError) as exc:
+                  print(f"ERROR: {exc}", file=sys.stderr)
+                  sys.exit(1)
+          KSUN_HOOK_PY
           test -f kernel/drivers/kernelsu/Kbuild
-          git -C kernel/KernelSU-Next rev-parse HEAD
+          grep -q 'ksu_handle_sys_reboot' kernel/kernel/reboot.c
+          echo 'All 5 manual hook locations patched.'
 
-      - name: Generate platina_defconfig and validate KernelSU settings
+      - name: Generate platina_defconfig and verify manual hook settings
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p kernel/out build-logs
-          export PATH="$GITHUB_WORKSPACE/toolchains/shims:$GITHUB_WORKSPACE/toolchains/clang12/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
-          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
-          export PATH="$(dirname "$CLANG_BIN"):$PATH"
+          # Clang is first on PATH; Android GCC 4.9 provides external assembler
+          # and 32-bit compat utilities required by this 4.4 Makefile.
           make -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
             CC=clang LD=ld.lld CROSS_COMPILE=aarch64-linux-android- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- \
             "$DEFCONFIG" 2>&1 | tee build-logs/config.log
+          # The official manual-hook guide requires CONFIG_KSU=y.
+          # Do not force KPROBES off: other kernel features may depend on it.
           kernel/scripts/config --file kernel/out/.config \
-            -e KSU -e KSU_MANUAL_HOOK -d KPROBES -d KSU_DEBUG \
-            -d KSU_KPROBES_HOOK -d KSU_SYSCALL_TABLE_HOOK \
-            -d KSU_EXTRAS -d KSU_TAMPER_SYSCALL_TABLE -d KSU_LSM_SECURITY_HOOKS
+            -e KSU -d KSU_DEBUG -d KSU_KPROBES_HOOK -d KSU_KPROBE_HOOKS \
+            -d KSU_SYSCALL_TABLE_HOOK
+          if grep -Eq '^[[:space:]]*config KSU_MANUAL_HOOK' kernel/KernelSU-Next/kernel/Kconfig; then
+            kernel/scripts/config --file kernel/out/.config -e KSU_MANUAL_HOOK
+          fi
           make -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
             CC=clang LD=ld.lld CROSS_COMPILE=aarch64-linux-android- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- \
             olddefconfig 2>&1 | tee -a build-logs/config.log
           grep -qx 'CONFIG_KSU=y' kernel/out/.config
-          grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' kernel/out/.config
-          grep -qx '# CONFIG_KPROBES is not set' kernel/out/.config
-          echo 'KernelSU Next: configured for manual hooks'
+          echo '[OK] CONFIG_KSU=y; KernelSU manual syscall hooks integrated'
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' kernel/out/.config | tee build-logs/ksu-config.txt
 
-      - name: Compile kernel with Clang 12
+      - name: Compile kernel using Clang 12
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p build-logs
-          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
-          export PATH="$GITHUB_WORKSPACE/toolchains/shims:$(dirname "$CLANG_BIN"):$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
-          make -C kernel -j2 O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
+          make -C kernel -j"$BUILD_JOBS" O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
             CC=clang LD=ld.lld CROSS_COMPILE=aarch64-linux-android- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- \
             Image.gz-dtb dtbs 2>&1 | tee build-logs/build.log
-          test -s kernel/out/arch/arm64/boot/Image.gz-dtb
-          { echo 'Kernel: FirmanBell/msm-4.4 (legacy)';
-            echo 'Config: platina_defconfig';
-            echo 'KernelSU Next: legacy / manual hook';
-            clang --version | head -n 1;
-            sha256sum kernel/out/arch/arm64/boot/Image.gz-dtb;
-          } > build-logs/summary.txt
+          if [[ ! -s kernel/out/arch/arm64/boot/Image.gz-dtb ]]; then
+            echo 'ERROR: Image.gz-dtb absent. Check CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE and build.log.' >&2
+            ls -lah kernel/out/arch/arm64/boot/ || true
+            exit 1
+          fi
 
-      - name: Upload kernel and build logs
+      - name: Package kernel files and checksums (not flashable)
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb dist/Image.gz-dtb
+          cp kernel/out/.config dist/platina.config
+          cp build-logs/{kernel-commit.txt,ksu-commit.txt,clang-version.txt} dist/
+          ( cd dist && sha256sum Image.gz-dtb > SHA256SUMS )
+          zip -q -r "platina-ksunext-clang12-run${GITHUB_RUN_NUMBER}-NOT-FLASHABLE.zip" dist
+          {
+            echo '### Platina KernelSU Next build'
+            echo "- Kernel: FirmanBell/msm-4.4 ($KERNEL_BRANCH)"
+            echo "- Defconfig: $DEFCONFIG"
+            echo "- Compiler: $(head -n 1 build-logs/clang-version.txt)"
+            echo "- KernelSU ref: $(cat build-logs/ksu-commit.txt)"
+            echo '- Hook mode: manual (no kprobes)'
+            echo '- Output: Image.gz-dtb (NOT directly flashable)'
+          } | tee build-logs/summary.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload kernel, config and logs (even on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -153,10 +400,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: |
+            dist/
+            platina-ksunext-clang12-run*-NOT-FLASHABLE.zip
             kernel/out/arch/arm64/boot/Image.gz-dtb
-            kernel/out/arch/arm64/boot/Image.gz
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/.config
             kernel/out/System.map
-            build-logs/*.log
-            build-logs/summary.txt
+            kernel/out/.config
+            build-logs/
