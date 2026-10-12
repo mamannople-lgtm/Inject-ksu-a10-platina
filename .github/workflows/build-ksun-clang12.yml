@@ -1,0 +1,162 @@
+name: Platina KernelSU Next - Clang 12
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: GitHubActions
+      KBUILD_BUILD_HOST: clang12
+      KERNEL_REPO: https://github.com/FirmanBell/msm-4.4.git
+      KERNEL_BRANCH: legacy
+      DEFCONFIG: platina_defconfig
+      KSU_BRANCH: legacy
+      GCC_REF: android-10.0.0_r41
+
+    steps:
+      - name: Checkout workflow and hook script
+        uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates curl flex git \
+            libelf-dev libssl-dev lz4 make python3 rsync unzip zip zlib1g-dev
+
+      - name: Fetch platina kernel source (legacy)
+        run: |
+          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" kernel
+          test -f "kernel/arch/arm64/configs/$DEFCONFIG"
+          git -C kernel rev-parse HEAD
+
+      - name: Download ZyCromerZ Clang 12.0.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains/clang12
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-12-link.txt \
+            -o clang12-url.txt
+          URL="$(tr -d '\r\n' < clang12-url.txt)"
+          case "$URL" in
+            https://github.com/ZyCromerZ/Clang/releases/download/12.*) ;;
+            *) echo "Unexpected Clang 12 URL: $URL"; exit 1 ;;
+          esac
+          curl -fL --retry 3 --retry-delay 5 "$URL" -o /tmp/clang12.tar.gz
+          tar -xzf /tmp/clang12.tar.gz -C toolchains/clang12
+          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
+          test -n "$CLANG_BIN" || { echo 'Clang binary missing'; exit 1; }
+          chmod +x "$CLANG_BIN"
+          echo "$(dirname "$CLANG_BIN")" >> "$GITHUB_PATH"
+          "$(dirname "$CLANG_BIN")/clang" --version | head -n 1
+          "$(dirname "$CLANG_BIN")/clang" --version | head -n 1 | grep -E 'version 12\.'
+          test -x "$(dirname "$CLANG_BIN")/ld.lld"
+
+      - name: Download Android GCC 4.9 binutils for external assembly
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "$GCC_REF" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            toolchains/gcc64
+          git clone --depth=1 --branch "$GCC_REF" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            toolchains/gcc32
+          test -x toolchains/gcc64/bin/aarch64-linux-android-as
+          test -x toolchains/gcc64/bin/aarch64-linux-android-elfedit
+          test -x toolchains/gcc32/bin/arm-linux-androideabi-gcc
+          # Kernel Makefile forces -no-integrated-as, while clang targets aarch64-linux-gnu.
+          # Supply an assembler under the GNU triple using the Android GCC 4.9 binutils.
+          mkdir -p toolchains/shims
+          ln -s "$GITHUB_WORKSPACE/toolchains/gcc64/bin/aarch64-linux-android-as" \
+            toolchains/shims/aarch64-linux-gnu-as
+          echo "$GITHUB_WORKSPACE/toolchains/shims" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
+
+      - name: Integrate KernelSU Next legacy (manual hooks for 4.4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "$KSU_BRANCH" \
+            https://github.com/KernelSU-Next/KernelSU-Next.git \
+            kernel/KernelSU-Next
+          ln -s ../KernelSU-Next/kernel kernel/drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> kernel/drivers/Makefile
+          sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' kernel/drivers/Kconfig
+          python3 scripts/apply_legacy_hooks.py kernel
+          test -f kernel/drivers/kernelsu/Kbuild
+          git -C kernel/KernelSU-Next rev-parse HEAD
+
+      - name: Generate platina_defconfig and validate KernelSU settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p kernel/out build-logs
+          export PATH="$GITHUB_WORKSPACE/toolchains/shims:$GITHUB_WORKSPACE/toolchains/clang12/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
+          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
+          export PATH="$(dirname "$CLANG_BIN"):$PATH"
+          make -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
+            CC=clang LD=ld.lld CROSS_COMPILE=aarch64-linux-android- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            "$DEFCONFIG" 2>&1 | tee build-logs/config.log
+          kernel/scripts/config --file kernel/out/.config \
+            -e KSU -e KSU_MANUAL_HOOK -d KPROBES -d KSU_DEBUG \
+            -d KSU_KPROBES_HOOK -d KSU_SYSCALL_TABLE_HOOK \
+            -d KSU_EXTRAS -d KSU_TAMPER_SYSCALL_TABLE -d KSU_LSM_SECURITY_HOOKS
+          make -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
+            CC=clang LD=ld.lld CROSS_COMPILE=aarch64-linux-android- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            olddefconfig 2>&1 | tee -a build-logs/config.log
+          grep -qx 'CONFIG_KSU=y' kernel/out/.config
+          grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' kernel/out/.config
+          grep -qx '# CONFIG_KPROBES is not set' kernel/out/.config
+          echo 'KernelSU Next: configured for manual hooks'
+
+      - name: Compile kernel with Clang 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
+          export PATH="$GITHUB_WORKSPACE/toolchains/shims:$(dirname "$CLANG_BIN"):$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
+          make -C kernel -j2 O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64 \
+            CC=clang LD=ld.lld CROSS_COMPILE=aarch64-linux-android- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            Image.gz-dtb dtbs 2>&1 | tee build-logs/build.log
+          test -s kernel/out/arch/arm64/boot/Image.gz-dtb
+          { echo 'Kernel: FirmanBell/msm-4.4 (legacy)';
+            echo 'Config: platina_defconfig';
+            echo 'KernelSU Next: legacy / manual hook';
+            clang --version | head -n 1;
+            sha256sum kernel/out/arch/arm64/boot/Image.gz-dtb;
+          } > build-logs/summary.txt
+
+      - name: Upload kernel and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platina-ksunext-clang12-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            kernel/out/System.map
+            build-logs/*.log
+            build-logs/summary.txt
