@@ -251,6 +251,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p build-logs
+          exec > >(tee build-logs/ksu-hooks.log) 2>&1
           # 'legacy' is the non-GKI branch. For a SHA, fetch that commit explicitly.
           if [[ "$KSU_REF" == "legacy" ]]; then
             git clone --single-branch --branch legacy --depth=1 \
@@ -389,13 +391,48 @@ jobs:
                            "\t\t\t      int *mode, int *flags);\n"
                            "#endif\n\n"
                            "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)")
-              replace_once(p,
-                           "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n\tif (mode & ~S_IRWXO)",
-                           "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n"
-                           "#ifdef CONFIG_KSU\n"
-                           "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
-                           "#endif\n"
-                           "\tif (mode & ~S_IRWXO)")
+              # V6: locate the declaration INSIDE faccessat(), not an exact
+              # two-line substring. Vendor kernels insert blank lines/comments
+              # and occasionally change the subsequent mode check.
+              source = p.read_text()
+              signature = "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)"
+              if source.count(signature) != 1:
+                  raise RuntimeError(f"{p}: faccessat signature count {source.count(signature)} (expected 1)")
+              function_start = source.index(signature)
+              function_body_start = source.find("{", function_start)
+              if not function_start < function_body_start < function_start + 350:
+                  raise RuntimeError(f"{p}: cannot locate faccessat function body")
+              # Keep the search near the beginning of this function so an
+              # unrelated lookup_flags declaration cannot be patched.
+              snippet = source[function_body_start:function_body_start + 1700]
+              import re
+              anchor = re.compile(
+                  r"(?m)^[ \t]*unsigned[ \t]+int[ \t]+lookup_flags[ \t]*=[ \t]*LOOKUP_FOLLOW[ \t]*;[^\n]*$"
+              )
+              matches = list(anchor.finditer(snippet))
+              if len(matches) == 1:
+                  insert_at = function_body_start + matches[0].end()
+                  hook = ("\n#ifdef CONFIG_KSU\n"
+                          "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                          "#endif")
+                  source = source[:insert_at] + hook + source[insert_at:]
+              else:
+                  # Alternate 4.4 vendor layout: inject before the first
+                  # faccessat mode check, after local variable declarations.
+                  mode_check = re.compile(r"(?m)^[ \t]*if[ \t]*\([ \t]*mode[ \t]*&[ \t]*~")
+                  modes = list(mode_check.finditer(snippet))
+                  if len(modes) != 1:
+                      raise RuntimeError(
+                          f"{p}: cannot safely locate faccessat injection point; "
+                          f"lookup_flags matches={len(matches)}, mode checks={len(modes)}; "
+                          f"function excerpt: {snippet[:650]!r}")
+                  insert_at = function_body_start + modes[0].start()
+                  hook = ("#ifdef CONFIG_KSU\n"
+                          "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                          "#endif\n")
+                  source = source[:insert_at] + hook + source[insert_at:]
+              p.write_text(source)
+              print(f"[OK] patched {p}: faccessat hook located inside function")
           
               p = root / "fs/read_write.c"
               replace_once(p,
@@ -464,6 +501,9 @@ jobs:
           test -f kernel/drivers/kernelsu/Kbuild
           grep -q 'ksu_handle_sys_reboot' kernel/kernel/reboot.c
           echo 'All 5 manual hook locations patched.'
+          git -C kernel diff -- fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c \
+            > "$GITHUB_WORKSPACE/build-logs/ksu-hooks.patch"
+          echo '[OK] Manual hook diff saved as build-logs/ksu-hooks.patch'
 
       - name: Generate platina_defconfig and verify manual hook settings
         shell: bash
