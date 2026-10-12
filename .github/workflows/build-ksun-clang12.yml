@@ -74,29 +74,99 @@ jobs:
           mkdir -p build-logs dist kernel/out
           git -C kernel rev-parse HEAD | tee build-logs/kernel-commit.txt
 
-      - name: Download ZyCromerZ Clang 12.0.1
+      - name: Download ZyCromerZ Clang 12.0.1 (GitHub Release with fallback)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          mkdir -p toolchains/clang12
-          curl --fail --location --silent --show-error --retry 4 "$CLANG_URL_FILE" -o /tmp/clang12-url.txt
-          CLANG_URL="$(tr -d '\r\n' < /tmp/clang12-url.txt)"
-          case "$CLANG_URL" in
-            https://github.com/ZyCromerZ/Clang/releases/download/*/*.tar.gz|https://github.com/ZyCromerZ/Clang/releases/download/*/*.tar.xz|https://github.com/ZyCromerZ/Clang/releases/download/*/*.tar.zst) ;;
-            *) echo "Unexpected Clang 12 download URL: $CLANG_URL" >&2; exit 1 ;;
-          esac
-          echo "Clang archive URL: $CLANG_URL"
-          curl --fail --location --silent --show-error --retry 4 --retry-delay 5 \
-            "$CLANG_URL" -o /tmp/clang12.tar.gz
-          tar -xf /tmp/clang12.tar.gz -C toolchains/clang12
-          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" -type f -path '*/bin/clang' -print -quit)"
-          test -n "$CLANG_BIN"
+          set -Eeuo pipefail
+          mkdir -p toolchains/clang12 build-logs /tmp/zyc12-release
+          exec > >(tee build-logs/clang-download.log) 2>&1
+
+          echo '=== Resolve official ZyCromerZ Clang 12 download pointer ==='
+          echo "Pointer: $CLANG_URL_FILE"
+          if ! curl -fLsS --retry 4 --retry-all-errors --retry-delay 4 \
+             --connect-timeout 30 "$CLANG_URL_FILE" -o /tmp/zyc12-link.txt; then
+            echo '::error::Cannot fetch official Clang-12-link.txt from ZyCromerZ.'
+            exit 1
+          fi
+          CLANG_URL="$(sed -n '1{s/\r$//;p;}' /tmp/zyc12-link.txt)"
+          if [[ ! "$CLANG_URL" =~ ^https://github\.com/ZyCromerZ/Clang/releases/download/([^/]+)/([^/?#]+\.tar\.(gz|xz))$ ]]; then
+            echo "::error::Unexpected ZyCromerZ Clang 12 URL: $CLANG_URL"
+            exit 1
+          fi
+          TAG="${BASH_REMATCH[1]}"
+          ASSET="${BASH_REMATCH[2]}"
+          [[ "$TAG" == *12* && "$ASSET" == Clang-12.* ]] || {
+            echo "::error::Refusing non-Clang-12 archive: $TAG / $ASSET"
+            exit 1
+          }
+          echo "Official release tag : $TAG"
+          echo "Official release file: $ASSET"
+          echo "Official download URL: $CLANG_URL"
+          ARCHIVE="/tmp/zyc12-release/$ASSET"
+
+          # gh release download uses the GitHub release assets API. If this method
+          # fails, use the official URL in Clang-12-link.txt as fallback.
+          if command -v gh >/dev/null 2>&1; then
+            echo '=== Attempt 1: GitHub CLI release download ==='
+            if gh release download "$TAG" \
+                --repo ZyCromerZ/Clang --pattern "$ASSET" \
+                --dir /tmp/zyc12-release; then
+              echo '[OK] gh release download completed.'
+            else
+              echo '::warning::GitHub CLI could not download this asset. Trying curl.'
+              rm -f "$ARCHIVE" # discard a partial asset, if any
+            fi
+          else
+            echo '::warning::GitHub CLI not installed; using curl.'
+          fi
+
+          if [[ ! -s "$ARCHIVE" ]]; then
+            echo '=== Attempt 2: direct official release URL via curl ==='
+            rm -f "$ARCHIVE"
+            if ! curl -fL --show-error --silent --retry 5 --retry-all-errors \
+                --retry-delay 8 --connect-timeout 30 \
+                --max-time 1500 --output "$ARCHIVE" \
+                --write-out 'HTTP status: %{http_code}; downloaded bytes: %{size_download}\n' \
+                "$CLANG_URL"; then
+              echo "::error::Unable to download $ASSET through GitHub CLI or curl."
+              echo '::error::Check the Clang-12-link.txt release asset and the HTTP errors above.'
+              exit 1
+            fi
+          fi
+
+          echo '=== Verify download and unpack ==='
+          ls -lh "$ARCHIVE"
+          BYTES="$(stat -c%s "$ARCHIVE")"
+          if (( BYTES < 10485760 )); then
+            echo "::error::Clang archive too small ($BYTES bytes); possibly error page or incomplete download."
+            exit 1
+          fi
+          if ! tar -tf "$ARCHIVE" >/dev/null; then
+            echo '::error::Downloaded archive failed tar integrity check.'
+            exit 1
+          fi
+          tar -xf "$ARCHIVE" -C toolchains/clang12
+          CLANG_BIN="$(find "$GITHUB_WORKSPACE/toolchains/clang12" -path '*/bin/clang' -print -quit)"
+          if [[ -z "$CLANG_BIN" || ! -x "$CLANG_BIN" ]]; then
+            echo '::error::No executable bin/clang found inside extracted archive.'
+            find toolchains/clang12 -maxdepth 3 -type d -print | head -30
+            exit 1
+          fi
           TC_BIN="$(dirname "$CLANG_BIN")"
-          test -x "$TC_BIN/ld.lld"
-          test -x "$TC_BIN/llvm-ar"
+          if [[ ! -x "$TC_BIN/ld.lld" || ! -x "$TC_BIN/llvm-ar" ]]; then
+            echo "::error::Required LLVM tools missing in $TC_BIN"
+            ls -lah "$TC_BIN" | head -50
+            exit 1
+          fi
+          "$TC_BIN/clang" --version | tee build-logs/clang-version.txt
+          if ! grep -Eiq 'clang version 12\.' build-logs/clang-version.txt; then
+            echo '::error::Downloaded compiler is NOT Clang 12. Check upstream release.'
+            exit 1
+          fi
           echo "$TC_BIN" >> "$GITHUB_PATH"
-          "$TC_BIN/clang" --version | head -n1 | tee build-logs/clang-version.txt
-          "$TC_BIN/clang" --version | head -n1 | grep -E 'version 12\.'
+          echo "Clang 12 ready: $TC_BIN"
 
       - name: Clone Android GCC 4.9 toolchains
         shell: bash
