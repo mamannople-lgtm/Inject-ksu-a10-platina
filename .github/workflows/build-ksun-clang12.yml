@@ -505,6 +505,46 @@ jobs:
             > "$GITHUB_WORKSPACE/build-logs/ksu-hooks.patch"
           echo '[OK] Manual hook diff saved as build-logs/ksu-hooks.patch'
 
+      - name: Adapt KernelSU Next legacy header for Linux 4.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          python3 - <<'KSU_LINUX44_COMPAT_PY' 2>&1 | tee build-logs/ksu-compat.log
+          from pathlib import Path
+          import sys
+
+          kernel = Path('kernel')
+          ksu_header = kernel / 'KernelSU-Next/kernel/runtime/ksud.h'
+          old_kernel_compiler = kernel / 'include/linux/compiler.h'
+          new_kernel_compiler = kernel / 'include/linux/compiler_types.h'
+          source_include = '#include <linux/compiler_types.h>'
+          replacement_include = '#include <linux/compiler.h>'
+
+          if not old_kernel_compiler.is_file():
+              sys.exit('ERROR: Missing kernel/include/linux/compiler.h. Cannot use Linux 4.4 fallback.')
+          if not ksu_header.is_file():
+              sys.exit(f'ERROR: Missing KernelSU Next header: {ksu_header}')
+
+          contents = ksu_header.read_text()
+          if new_kernel_compiler.is_file():
+              print('[SKIP] compiler_types.h is present. No 4.4 fallback needed.')
+          elif contents.count(source_include) == 1:
+              # Linux 4.4 provides the compiler definitions via linux/compiler.h.
+              # Patch KernelSU Next only; leave existing kernel headers untouched.
+              ksu_header.write_text(contents.replace(source_include, replacement_include, 1))
+              print('[PATCHED] KernelSU Next runtime/ksud.h: compiler_types.h -> compiler.h')
+          elif contents.count(source_include) > 1:
+              sys.exit('ERROR: unexpected duplicate compiler_types.h includes in ksud.h')
+          else:
+              print('[SKIP] The current KernelSU Next ksud.h does not include compiler_types.h.')
+
+          final = ksu_header.read_text()
+          if not new_kernel_compiler.is_file() and source_include in final:
+              sys.exit('ERROR: unresolved linux/compiler_types.h include in ksud.h')
+          print('[OK] KernelSU header compatibility check completed')
+          KSU_LINUX44_COMPAT_PY
+
       - name: Generate platina_defconfig and verify manual hook settings
         shell: bash
         run: |
@@ -564,6 +604,36 @@ jobs:
             echo '- Hook mode: manual (no kprobes)'
             echo '- Output: Image.gz-dtb (NOT directly flashable)'
           } | tee build-logs/summary.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize first build error (when failed)
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p build-logs
+          if [[ -s build-logs/build.log ]]; then
+            echo '=== First relevant compiler and linker errors ==='
+            grep -Enim 20 'fatal error:|(^|[[:space:]])error:|undefined reference|No rule to make target|ld.lld: error:|clang: error:' \
+              build-logs/build.log | tee build-logs/first-errors.txt || true
+            first_line="$(grep -Enim 1 'fatal error:|(^|[[:space:]])error:|undefined reference|No rule to make target|ld.lld: error:|clang: error:' \
+              build-logs/build.log | cut -d: -f1 || true)"
+            if [[ -n "$first_line" ]]; then
+              start=$(( first_line > 8 ? first_line - 8 : 1 ))
+              end=$(( first_line + 22 ))
+              echo '=== Context of first error ==='
+              sed -n "${start},${end}p" build-logs/build.log | tee build-logs/first-error-context.txt
+              {
+                echo '### Kernel build failed — first diagnostic'
+                echo '```text'
+                cat build-logs/first-error-context.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'No compiler/linker error token found in build.log.' | tee build-logs/first-errors.txt
+            fi
+          else
+            echo 'Build log was not created; failure occurred before kernel compilation.' | tee build-logs/first-errors.txt
+          fi
 
       - name: Upload kernel, config and logs (even on failure)
         if: always()
