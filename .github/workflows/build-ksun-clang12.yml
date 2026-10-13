@@ -370,6 +370,27 @@ jobs:
         \ \n \tif (!ctx)\n \t\treturn 0;\nBACKPORT_PATCH\ngit -C kernel apply --check ../build-logs/legacy-backports.patch\n\
         git -C kernel apply ../build-logs/legacy-backports.patch\ngit -C kernel diff > build-logs/kernel-changes.patch\n\
         git -C kernel/KernelSU-Next diff > build-logs/ksu-compat.patch\n"
+    - name: Fix Manager detection file I/O on Linux 4.4
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'MANAGER_IO_PY'
+        from pathlib import Path
+        import re
+        root = Path('kernel/KernelSU-Next/kernel')
+        for rel in ('manager/apk_sign.c', 'manager/throne_tracker.c'):
+            p = root / rel
+            source = p.read_text()
+            # Both files contain two actual reads; do not count comments.
+            calls = [line for line in source.splitlines() if 'kernel_read(' in line and not line.lstrip().startswith('//')]
+            assert len(calls) == 2, (rel, len(calls))
+            source = re.sub(r'\bkernel_read\(', 'ksu_kernel_read_compat(', source)
+            if '#include "compat/kernel_compat.h"' not in source:
+                source = '#include "compat/kernel_compat.h"\n' + source
+            p.write_text(source)
+            print('[MANAGER_IO]', rel, 'uses legacy-safe reads with advancing offsets')
+        MANAGER_IO_PY
+        git -C kernel/KernelSU-Next diff > build-logs/ksu-compat.patch
     - name: Generate platina_defconfig and verify manual hook settings
       shell: bash
       run: |
