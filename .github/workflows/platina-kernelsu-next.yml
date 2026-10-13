@@ -1,0 +1,984 @@
+name: Platina KernelSU Next | Clang 12 | pinned build
+permissions:
+  contents: read
+concurrency:
+  group: platina-ksun-clang12-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: ISAL
+      KBUILD_BUILD_HOST: LocalEmpty
+      KERNEL_REPO: https://github.com/FirmanBell/msm-4.4.git
+      KERNEL_BRANCH: legacy
+      DEFCONFIG: platina_defconfig
+      KSU_REF: 3ade559d798d76870c35a62267c06112b5524379
+      BUILD_JOBS: ${{ inputs.build_jobs }}
+      KERNEL_COMMIT: 4af53b46cc9ecb8e31de299e1d6044210a297590
+      CLANG_SHA256: 2453486456a5ddbed677bccb1dba70a04cbd3c7dfe8947dcb9a83525a20a4adf
+    steps:
+    - name: Checkout this repository
+      uses: actions/checkout@v4
+    - name: Prepare CI environment (no external Python scripts required)
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p build-logs dist toolchains
+        echo 'Single-file workflow; scripts/ folder is NOT required.'
+        echo "Repository: $GITHUB_REPOSITORY"
+        echo "Runner workspace: $GITHUB_WORKSPACE"
+        git rev-parse --short HEAD | tee build-logs/workflow-commit.txt
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends           bc bison build-essential ca-certificates curl flex git           libelf-dev libssl-dev lz4 python3 rsync unzip zip zlib1g-dev
+    - name: Checkout FirmanBell legacy kernel
+      shell: bash
+      run: |
+        set -euo pipefail
+        git init kernel
+        git -C kernel remote add origin "$KERNEL_REPO"
+        git -C kernel fetch --depth=1 origin "$KERNEL_COMMIT"
+        git -C kernel checkout --detach FETCH_HEAD
+        test "$(git -C kernel rev-parse HEAD)" = "$KERNEL_COMMIT"
+        test -f "kernel/arch/arm64/configs/$DEFCONFIG"
+        mkdir -p build-logs dist kernel/out
+        git -C kernel rev-parse HEAD | tee build-logs/kernel-commit.txt
+    - name: Download and verify pinned ZyCromerZ Clang 12.0.1
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p toolchains/clang12 build-logs
+        exec > >(tee build-logs/clang-download.log) 2>&1
+        curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 1500   https://github.com/ZyCromerZ/Clang/releases/download/12.0.1-20230207-release/Clang-12.0.1-20230207.tar.gz   -o toolchains/clang12.tar.gz
+        printf '%s  %s
+' "$CLANG_SHA256" toolchains/clang12.tar.gz | sha256sum -c -
+        tar -xf toolchains/clang12.tar.gz -C toolchains/clang12
+        test -x toolchains/clang12/bin/clang
+        test -x toolchains/clang12/bin/ld.lld
+        toolchains/clang12/bin/clang --version | tee build-logs/clang-version.txt
+        grep -q 'clang version 12.0.1' build-logs/clang-version.txt
+        echo "$GITHUB_WORKSPACE/toolchains/clang12/bin" >> "$GITHUB_PATH"
+    - name: Checkout pinned Android GCC 4.9 toolchains
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p toolchains build-logs
+        exec > >(tee build-logs/gcc-download.log) 2>&1
+        fetch_toolchain() {
+          local repo="$1" dest="$2" commit="$3"
+          git init "$dest"
+          git -C "$dest" remote add origin "https://github.com/LineageOS/$repo.git"
+          git -C "$dest" fetch --depth=1 origin "$commit"
+          git -C "$dest" checkout --detach FETCH_HEAD
+          test "$(git -C "$dest" rev-parse HEAD)" = "$commit"
+        }
+        fetch_toolchain android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9   toolchains/gcc64 5e030eafe024784a73cdf47e6936ac0dbfc763dc
+        fetch_toolchain android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9   toolchains/gcc32 111258a10e017f067b27e6cfcea7619d753f3309
+        # LineageOS GCC wrappers use /usr/bin/python; adapt the shebang to Python 3.
+        python3 - <<'GCC_WRAPPER_PY'
+        from pathlib import Path
+        for root in (Path('toolchains/gcc64/bin'), Path('toolchains/gcc32/bin')):
+            for p in root.iterdir():
+                if not p.is_file():
+                    continue
+                with p.open('rb') as f:
+                    first = f.readline(100)
+                if first == b'#!/usr/bin/python
+':
+                    p.write_bytes(p.read_bytes().replace(first, b'#!/usr/bin/env python3
+', 1))
+        GCC_WRAPPER_PY
+        toolchains/gcc64/bin/aarch64-linux-android-gcc --version | tee build-logs/gcc64-version.txt
+        toolchains/gcc32/bin/arm-linux-androideabi-gcc --version | tee build-logs/gcc32-version.txt
+        for tool in toolchains/gcc64/bin/aarch64-linux-android-as             toolchains/gcc64/bin/aarch64-linux-android-elfedit             toolchains/gcc32/bin/arm-linux-androideabi-gcc; do
+          test -x "$tool"
+        done
+        {
+          git -C toolchains/gcc64 rev-parse HEAD
+          git -C toolchains/gcc32 rev-parse HEAD
+        } | tee build-logs/gcc-commits.txt
+        echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_PATH"
+        echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
+    - name: Integrate pinned KernelSU Next and Linux 4.4 backports
+      shell: bash
+      run: "set -euo pipefail
+mkdir -p build-logs
+exec > >(tee build-logs/ksu-hooks.log) 2>&1
+git clone https://github.com/KernelSU-Next/KernelSU-Next.git        \ kernel/KernelSU-Next
+git -C kernel/KernelSU-Next checkout --detach "$KSU_REF"
+test "$(git -C kernel/KernelSU-Next        \ rev-parse HEAD)" = "$KSU_REF"
+git -C kernel/KernelSU-Next rev-parse HEAD | tee build-logs/ksu-commit.txt
+        python3 - kernel <<'INTEGRATE_PY'
+#!/usr/bin/env python3
+"""Integrate a checked-out KernelSU Next legacy        \ tree into a Linux kernel.
+
+Run from the CI working directory after cloning kernel/KernelSU-Next.
+Only        \ changes drivers/Kconfig, drivers/Makefile, drivers/kernelsu symlink.
+"""
+import os
+from pathlib        \ import Path
+import sys
+
+
+def integrate(kernel: Path) -> None:
+    kernel = kernel.resolve()
+           \ drivers = kernel / 'drivers'
+    ksu = kernel / 'KernelSU-Next' / 'kernel'
+    target = drivers / 'kernelsu'
+        \    mk = drivers / 'Makefile'
+    cfg = drivers / 'Kconfig'
+    for check in (drivers, mk, cfg, ksu /        \ 'Kconfig', ksu / 'Kbuild',
+                  kernel / 'arch/arm64/configs/platina_defconfig'):
+            \    if not check.exists():
+            raise RuntimeError(f'Missing required kernel file: {check}')
+
+        \    if target.is_symlink():
+        if target.resolve() != ksu.resolve():
+            raise RuntimeError(f'Existing        \ kernelsu link points elsewhere: {target}')
+    elif target.exists():
+        raise RuntimeError(f'Refusing        \ to overwrite existing kernelsu path: {target}')
+    else:
+        target.symlink_to(os.path.relpath(ksu,        \ drivers), target_is_directory=True)
+
+    makeline = 'obj-$(CONFIG_KSU) += kernelsu/'
+    data = mk.read_text()
+        \    if data.count(makeline) > 1:
+        raise RuntimeError('drivers/Makefile contains duplicate KernelSU        \ entries')
+    if makeline not in data:
+        mk.write_text(data.rstrip('\n') + '\n' + makeline +        \ '\n')
+
+    line = 'source "drivers/kernelsu/Kconfig"'
+    data = cfg.read_text()
+    if data.count(line)        \ > 1:
+        raise RuntimeError('drivers/Kconfig contains duplicate KernelSU entries')
+    if line not        \ in data:
+        # Scope to the last *top-level* endmenu, avoiding sed's global insertion.
+        marker        \ = '\nendmenu'
+        pos = data.rfind(marker)
+        if pos == -1:
+            raise RuntimeError('drivers/Kconfig:        \ closing endmenu not found')
+        cfg.write_text(data[:pos] + '\n' + line + '\n' + data[pos:])
+        \    assert mk.read_text().count(makeline) == 1
+    assert cfg.read_text().count(line) == 1
+    print('[OK]        \ KernelSU Next legacy linked exactly once')
+
+
+if __name__ == '__main__':
+    try:
+        integrate(Path(sys.argv[1]        \ if len(sys.argv) == 2 else 'kernel'))
+    except (RuntimeError, OSError) as e:
+        print('ERROR:',        \ e, file=sys.stderr)
+        sys.exit(1)
+INTEGRATE_PY
+python3 - kernel <<'HOOKS_PY'
+#!/usr/bin/env        \ python3
+"""Manual hooks for pinned FirmanBell 4.4 + KernelSU Next legacy."""
+from pathlib import        \ Path
+import sys
+root=Path(sys.argv[1]).resolve()
+
+def edit(rel,old,new):
+    p=root/rel
+    s=p.read_text()
+        \    if s.count(old)!=1:
+        raise SystemExit(f'{rel}: expected exactly one anchor: {old!r}')
+           \ p.write_text(s.replace(old,new,1))
+    print('[HOOK]',rel)
+
+edit('fs/exec.c','static int do_execveat_common(int        \ fd, struct filename *filename,',
+'''#ifdef CONFIG_KSU
+extern int ksu_handle_execveat(int *, struct filename        \ **, void *, void *, int *);
+#endif
+static int do_execveat_common(int fd, struct filename *filename,''')
+        edit('fs/exec.c','\tint retval;\n\n\tif (IS_ERR(filename))',
+'''\tint retval;
+#ifdef CONFIG_KSU
+        \tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+#endif
+
+\tif (IS_ERR(filename))''')
+        edit('fs/open.c','SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)',
+'''#ifdef        \ CONFIG_KSU
+extern int ksu_handle_faccessat(int *, const char __user **, int *, int *);
+#endif
+SYSCALL_DEFINE3(faccessat,        \ int, dfd, const char __user *, filename, int, mode)''')
+p=root/'fs/open.c'
+s=p.read_text(); pos=s.index('SYSCALL_DEFINE3(faccessat,');        \ end=s.index('\n}',pos)
+body=s[pos:end]
+old='\tif (mode & ~S_IRWXO)'
+assert body.count(old)==1
+body=body.replace(old,'''#ifdef        \ CONFIG_KSU
+\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+#endif
+\tif (mode & ~S_IRWXO)''')
+        p.write_text(s[:pos]+body+s[end:])
+edit('fs/read_write.c','SYSCALL_DEFINE3(read, unsigned int, fd, char        \ __user *, buf, size_t, count)',
+'''#ifdef CONFIG_KSU
+extern void ksu_handle_sys_read(unsigned int fd);
+        #endif
+SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)''')
+edit('fs/read_write.c','SYSCALL_DEFINE3(read,        \ unsigned int, fd, char __user *, buf, size_t, count)\n{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t        \ ret = -EBADF;',
+'''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{
+\        tstruct fd f;
+\tssize_t ret = -EBADF;
+#ifdef CONFIG_KSU
+\tksu_handle_sys_read(fd);
+#endif
+\tf =        \ fdget_pos(fd);''')
+edit('fs/stat.c','int vfs_fstatat(int dfd, const char __user *filename, struct kstat        \ *stat,',
+'''#ifdef CONFIG_KSU
+extern int ksu_handle_stat(int *, const char __user **, int *);
+extern        \ void ksu_handle_newfstat_ret(unsigned int *, struct stat __user **);
+#endif
+int vfs_fstatat(int dfd,        \ const char __user *filename, struct kstat *stat,''')
+edit('fs/stat.c','\tunsigned int lookup_flags =        \ 0;\n\n\tif ((flag &',
+'''\tunsigned int lookup_flags = 0;
+#ifdef CONFIG_KSU
+\tksu_handle_stat(&dfd,        \ &filename, &flag);
+#endif
+
+\tif ((flag &''')
+old='\t\terror = cp_new_stat(&stat, statbuf);\n\        n\treturn error;\n}\n\nSYSCALL_DEFINE4(readlinkat,'
+edit('fs/stat.c',old,'''\t\terror = cp_new_stat(&stat,        \ statbuf);
+#ifdef CONFIG_KSU
+\tif (!error)
+\t\tksu_handle_newfstat_ret(&fd, &statbuf);
+#endif
+
+        \treturn error;
+}
+
+SYSCALL_DEFINE4(readlinkat,''')
+edit('kernel/reboot.c','SYSCALL_DEFINE4(reboot,        \ int, magic1, int, magic2, unsigned int, cmd,',
+'''#ifdef CONFIG_KSU
+extern int ksu_handle_sys_reboot(int,        \ int, unsigned int, void __user **);
+#endif
+SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned        \ int, cmd,''')
+edit('kernel/reboot.c','\tchar buffer[256];\n\tint ret = 0;',
+'''\tchar buffer[256];
+        \tint ret = 0;
+#ifdef CONFIG_KSU
+\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+#endif''')
+edit('drivers/input/input.c','static        \ void input_handle_event(struct input_dev *dev,',
+'''#ifdef CONFIG_KSU
+extern int ksu_handle_input_handle_event(unsigned        \ int *, unsigned int *, int *);
+#endif
+static void input_handle_event(struct input_dev *dev,''')
+edit('drivers/input/input.c','\        tint disposition;\n\n\tdisposition = input_get_disposition',
+'''\tint disposition;
+#ifdef CONFIG_KSU
+        \tksu_handle_input_handle_event(&type, &code, &value);
+#endif
+
+\tdisposition = input_get_disposition''')
+        HOOKS_PY
+python3 - kernel <<'COMPAT_PY'
+#!/usr/bin/env python3
+"""Linux 4.4 header adaptation. Only        \ the pinned KSU checkout is modified."""
+from pathlib import Path
+import sys
+kernel=Path(sys.argv[1]).resolve()
+        ksu=kernel/'KernelSU-Next/kernel'
+for p in sorted(ksu.rglob('*')):
+    if p.suffix not in ('.c','.h'):        \ continue
+    s=p.read_text()
+    for old,new in [('linux/compiler_types.h','linux/compiler.h'),
+          \                  ('linux/sched/signal.h','linux/sched.h'),
+                    ('linux/sched/task.h','linux/sched.h'),
+        \                    ('linux/sched/user.h','linux/sched.h'),
+                    ('linux/sched/task_stack.h','linux/sched.h')]:
+        \        if not (kernel/'include'/old).exists():
+            s=s.replace('<'+old+'>','<'+new+'>')
+           \ if s!=p.read_text():
+        p.write_text(s)
+        print('[COMPAT]',p.relative_to(kernel))
+p=ksu/'manager/apk_sign.c'
+        s=p.read_text()
+if '#include "compat/kernel_compat.h"' not in s:
+    s=s.replace('#include "klog.h"        ', '#include "compat/kernel_compat.h"\n#include "klog.h"',1)
+    p.write_text(s)
+    print('[COMPAT]        \ manager/apk_sign.c: kvmalloc compatibility')
+# The pre-4.14 file APIs use an offset value, rather than        \ loff_t *.
+# The existing upstream wrappers adapt the signature and advance the position.
+for rel in        \ ('policy/allowlist.c', 'runtime/ksud_integration.c'):
+    p=ksu/rel
+    s=p.read_text()
+    import        \ re
+    new=re.sub(r'\bkernel_read\(', 'ksu_kernel_read_compat(', s)
+    new=re.sub(r'\bkernel_write\        (', 'ksu_kernel_write_compat(', new)
+    if new!=s:
+        p.write_text(new)
+        print('[COMPAT]',rel,':        \ file I/O signature and offset')
+p=ksu/'sulog/event.c'
+s=p.read_text()
+if 'in_compat_syscall()' in s:
+        \    p.write_text(s.replace('in_compat_syscall()', 'is_compat_task()'))
+    print('[COMPAT] sulog/event.c:        \ ARM64 compat task detection')
+p=ksu/'compat/kernel_compat.h'
+s=p.read_text()
+addition='''
+/* Linux        \ 4.4 has no CFI instrumentation and predates these helper names. */
+#ifndef __nocfi
+#define __nocfi
+        #endif
+#ifndef ALIGN_DOWN
+#define ALIGN_DOWN(x, a) round_down(x, a)
+#endif
+'''
+if 'Linux 4.4 has no        \ CFI instrumentation' not in s:
+    s=s.replace('#define __KSU_H_KERNEL_COMPAT\n','#define __KSU_H_KERNEL_COMPAT\        n'+addition,1)
+    p.write_text(s)
+    print('[COMPAT] CFI annotation and downward alignment names')
+        p=ksu/'feature/adb_root.c'
+s=p.read_text()
+if '#include "compat/kernel_compat.h"' not in s:
+    p.write_text('#include        \ "compat/kernel_compat.h"\n'+s)
+# Expose the configuration actually compiled, rather than an unrelated        \ stock config.
+p=kernel/'kernel/Makefile'
+s=p.read_text()
+old='$(obj)/config_data.gz: arch/arm64/configs/platina-stock_defconfig        \ FORCE'
+new='$(obj)/config_data.gz: .config FORCE'
+if old in s:
+    assert s.count(old)==1
+    p.write_text(s.replace(old,new,1))
+        \    print('[COMPAT] IKCONFIG: embed the actual build configuration')
+else:
+    assert new in s
+COMPAT_PY
+        cat > build-logs/legacy-backports.patch <<'BACKPORT_PATCH'
+diff --git a/fs/internal.h b/fs/internal.h
+        index 0ec68117..788e4a0b 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -64,6 +64,7 @@ extern int        \ finish_automount(struct vfsmount *, struct path *);
+ extern int sb_prepare_remount_readonly(struct super_block        \ *);
+ 
+ extern void __init mnt_init(void);
++int path_umount(struct path *path, int flags);
+ 
+ extern        \ int __mnt_want_write(struct vfsmount *);
+ extern int __mnt_want_write_file(struct file *);
+diff --git        \ a/fs/namespace.c b/fs/namespace.c
+index edeb8b9c..d8a0b500 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+        @@ -1734,6 +1734,36 @@ SYSCALL_DEFINE1(oldumount, char __user *, name)
+ 
+ #endif
+ 
++static int can_umount(const        \ struct path *path, int flags)
++ {
++	 struct mount *mnt = real_mount(path->mnt);
++	 if (flags & ~(MNT_FORCE        \ | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
++		 return -EINVAL;
++	 if (!may_mount())
++		 return        \ -EPERM;
++	 if (path->dentry != path->mnt->mnt_root)
++		 return -EINVAL;
++	 if (!check_mnt(mnt))
+        +		 return -EINVAL;
++	 if (mnt->mnt.mnt_flags & MNT_LOCKED)
++		 return -EINVAL;
++	 if (flags &        \ MNT_FORCE && !capable(CAP_SYS_ADMIN))
++		 return -EPERM;
++	 return 0;
++ }
++
++int path_umount(struct        \ path *path, int flags)
++ {
++	 struct mount *mnt = real_mount(path->mnt);
++	 int ret;
++	 ret = can_umount(path,        \ flags);
++	 if (!ret)
++		 ret = do_umount(mnt, flags);
++	 dput(path->dentry);
++	 mntput_no_expire(mnt);
+        +	 return ret;
++ }
++
+ static bool is_mnt_ns_file(struct dentry *dentry)
+ {
+ 	/* Is this a proxy for        \ a mount namespace? */
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index 50c460a9..0fe69924        \ 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -9,6 +9,7 @@
+ #ifdef CONFIG_SECCOMP
+        \ 
+ #include <linux/thread_info.h>
++#include <linux/atomic.h>
+ #include <asm/seccomp.h>
+ 
+ struct seccomp_filter;
+        @@ -25,6 +26,7 @@ struct seccomp_filter;
+  */
+ struct seccomp {
+ 	int mode;
++	atomic_t filter_count;
+        \ 	struct seccomp_filter *filter;
+ };
+ 
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+        index ae330968..b475bd6f 100644
+--- fortified/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -193,7        \ +193,7 @@ static inline u32 cred_sid(const struct cred *cred)
+ {
+ 	const struct task_security_struct        \ *tsec;
+ 
+-	tsec = cred->security;
++	tsec = selinux_cred(cred);
+ 	return tsec->sid;
+ }
+ 
+@@ -215,7        \ +215,7 @@ static inline u32 task_sid(const struct task_struct *task)
+  */
+ static inline u32 current_sid(void)
+        \ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct        \ *tsec = selinux_cred(current_cred());
+ 
+ 	return tsec->sid;
+ }
+@@ -252,7 +252,7 @@ static void inode_free_rcu(struct        \ rcu_head *head)
+ 
+ static void inode_free_security(struct inode *inode)
+ {
+-	struct inode_security_struct        \ *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	struct superblock_security_struct        \ *sbsec = inode->i_sb->s_security;
+ 
+ 	/*
+@@ -367,7 +367,7 @@ static int may_context_mount_sb_relabel(u32        \ sid,
+ 			struct superblock_security_struct *sbsec,
+ 			const struct cred *cred)
+ {
+-	const        \ struct task_security_struct *tsec = cred->security;
++	const struct task_security_struct *tsec = selinux_cred(cred);
+        \ 	int rc;
+ 
+ 	rc = avc_has_perm(tsec->sid, sbsec->sid, SECCLASS_FILESYSTEM,
+@@ -384,7 +384,7 @@ static        \ int may_context_mount_inode_relabel(u32 sid,
+ 			struct superblock_security_struct *sbsec,
+ 			        const struct cred *cred)
+ {
+-	const struct task_security_struct *tsec = cred->security;
++	const struct        \ task_security_struct *tsec = selinux_cred(cred);
+ 	int rc;
+ 	rc = avc_has_perm(tsec->sid, sbsec->sid,        \ SECCLASS_FILESYSTEM,
+ 			  FILESYSTEM__RELABELFROM, NULL);
+@@ -1295,7 +1295,7 @@ static int selinux_genfs_get_sid(struct        \ dentry *dentry,
+ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)
+        \ {
+ 	struct superblock_security_struct *sbsec = NULL;
+-	struct inode_security_struct *isec = inode->i_security;
+        +	struct inode_security_struct *isec = selinux_inode(inode);
+ 	u32 sid;
+ 	struct dentry *dentry;
+        \ #define INITCONTEXTLEN 255
+@@ -1633,7 +1633,7 @@ static int inode_has_perm(const struct cred *cred,
+        \ 		return 0;
+ 
+ 	sid = cred_sid(cred);
+-	isec = inode->i_security;
++	isec = selinux_inode(inode);
+        \ 
+ 	return avc_has_perm(sid, isec->sid, isec->sclass, perms, adp);
+ }
+@@ -1729,7 +1729,7 @@ static        \ int selinux_determine_inode_label(const struct inode *dir,
+ {
+ 	const struct superblock_security_struct        \ *sbsec = dir->i_sb->s_security;
+ 	const struct inode_security_struct *dsec = dir->i_security;
+-	const        \ struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec =        \ selinux_cred(current_cred());
+ 
+ 	if ((sbsec->flags & SE_SBINITIALIZED) &&
+ 	    (sbsec->behavior        \ == SECURITY_FS_USE_MNTPOINT)) {
+@@ -1750,7 +1750,7 @@ static int may_create(struct inode *dir,
+ 		        \      struct dentry *dentry,
+ 		      u16 tclass)
+ {
+-	const struct task_security_struct *tsec =        \ current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	struct        \ inode_security_struct *dsec;
+ 	struct superblock_security_struct *sbsec;
+ 	u32 sid, newsid;
+@@ -2022,7        \ +2022,7 @@ static int selinux_binder_transfer_file(struct task_struct *from,
+ 	u32 sid = task_sid(to);
+        \ 	struct file_security_struct *fsec = file->f_security;
+ 	struct inode *inode = d_backing_inode(file->f_path.dentry);
+        -	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+        \ 	struct common_audit_data ad;
+ 	int rc;
+ 
+@@ -2225,9 +2225,9 @@ static int selinux_binder_transfer_file(struct task_struct *from,
+ 	u32 sid = task_sid(to);
+ 	struct file_security_struct *fsec = file->f_security;
+ 	struct inode *inode = d_backing_inode(file->f_path.dentry);
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	struct common_audit_data ad;
+ 	int rc;
+ 
+@@ -2225,9 +2225,9 @@ static int selinux_bprm_set_creds(struct linux_binprm *bprm)
+ 	if (bprm->cred_prepared)
+ 		return 0;
+ 
+-	old_tsec = current_security();
+-	new_tsec = bprm->cred->security;
+-	isec = inode->i_security;
++	old_tsec = selinux_cred(current_cred());
++	new_tsec = selinux_cred(bprm->cred);
++	isec = selinux_inode(inode);
+ 
+ 	/* Default to the current task SID. */
+ 	new_tsec->sid = old_tsec->sid;
+@@ -2327,7 +2327,7 @@ static int selinux_bprm_set_creds(struct linux_binprm *bprm)
+ 
+ static int selinux_bprm_secureexec(struct linux_binprm *bprm)
+ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	(void)tsec;
+ 	u32 sid, osid;
+ 	int atsecure = 0;
+@@ -2409,7 +2409,7 @@ static void selinux_bprm_committing_creds(struct linux_binprm *bprm)
+ 	struct rlimit *rlim, *initrlim;
+ 	int rc, i;
+ 
+-	new_tsec = bprm->cred->security;
++	new_tsec = selinux_cred(bprm->cred);
+ 	if (new_tsec->sid == new_tsec->osid)
+ 		return;
+ 
+@@ -2450,7 +2450,7 @@ static void selinux_bprm_committing_creds(struct linux_binprm *bprm)
+  */
+ static void selinux_bprm_committed_creds(struct linux_binprm *bprm)
+ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	struct itimerval itimer;
+ 	u32 osid, sid;
+ 	int rc, i;
+@@ -2762,7 +2762,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
+ 				       const char **name,
+ 				       void **value, size_t *len)
+ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	struct inode_security_struct *dsec;
+ 	struct superblock_security_struct *sbsec;
+ 	u32 sid, newsid, clen;
+@@ -2784,7 +2784,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
+ 
+ 	/* Possibly defer initialization to selinux_complete_init. */
+ 	if (sbsec->flags & SE_SBINITIALIZED) {
+-		struct inode_security_struct *isec = inode->i_security;
++		struct inode_security_struct *isec = selinux_inode(inode);
+ 		isec->sclass = inode_mode_to_security_class(inode->i_mode);
+ 		isec->sid = newsid;
+ 		isec->initialized = 1;
+@@ -2868,7 +2868,7 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
+ 	ad.type = LSM_AUDIT_DATA_DENTRY;
+ 	ad.u.dentry = dentry;
+ 	sid = cred_sid(cred);
+-	isec = inode->i_security;
++	isec = selinux_inode(inode);
+ 
+ 	return avc_has_perm_flags(sid, isec->sid, isec->sclass, FILE__READ, &ad,
+ 				  rcu ? MAY_NOT_BLOCK : 0);
+@@ -2881,7 +2881,7 @@ static noinline int audit_inode_permission(struct inode *inode,
+ {
+ #ifdef CONFIG_AUDIT
+ 	struct common_audit_data ad;
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	int rc;
+ 
+ 	ad.type = LSM_AUDIT_DATA_INODE;
+@@ -2922,7 +2922,7 @@ static int selinux_inode_permission(struct inode *inode, int mask)
+ 	perms = file_mask_to_av(inode->i_mode, mask);
+ 
+ 	sid = cred_sid(cred);
+-	isec = inode->i_security;
++	isec = selinux_inode(inode);
+ 
+ 	rc = avc_has_perm_noaudit(sid, isec->sid, isec->sclass, perms, 0, &avd);
+ 	audited = avc_audit_required(perms, &avd, rc,
+@@ -2995,7 +2995,7 @@ static int selinux_inode_setxattr(struct dentry *dentry, const char *name,
+ 				  const void *value, size_t size, int flags)
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	struct superblock_security_struct *sbsec;
+ 	struct common_audit_data ad;
+ 	u32 newsid, sid = current_sid();
+@@ -3072,7 +3072,7 @@ static void selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
+ 					int flags)
+ {
+ 	struct inode *inode = d_backing_inode(dentry);
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	u32 newsid;
+ 	int rc;
+ 
+@@ -3130,7 +3130,7 @@ static int selinux_inode_getsecurity(const struct inode *inode, const char *name
+ 	u32 size;
+ 	int error;
+ 	char *context = NULL;
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 
+ 	if (strcmp(name, XATTR_SELINUX_SUFFIX))
+ 		return -EOPNOTSUPP;
+@@ -3169,7 +3169,7 @@ out_nofree:
+ static int selinux_inode_setsecurity(struct inode *inode, const char *name,
+ 				     const void *value, size_t size, int flags)
+ {
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	u32 newsid;
+ 	int rc;
+ 
+@@ -3199,7 +3199,7 @@ static int selinux_inode_listsecurity(struct inode *inode, char *buffer, size_t
+ 
+ static void selinux_inode_getsecid(const struct inode *inode, u32 *secid)
+ {
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	*secid = isec->sid;
+ }
+ 
+@@ -3222,7 +3222,7 @@ static int selinux_file_permission(struct file *file, int mask)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct file_security_struct *fsec = file->f_security;
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	u32 sid = current_sid();
+ 
+ 	if (!mask)
+@@ -3257,7 +3257,7 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
+ 	struct common_audit_data ad;
+ 	struct file_security_struct *fsec = file->f_security;
+ 	struct inode *inode = file_inode(file);
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	struct lsm_ioctlop_audit ioctl;
+ 	u32 ssid = cred_sid(cred);
+ 	int rc;
+@@ -3569,7 +3569,7 @@ static int selinux_cred_alloc_blank(struct cred *cred, gfp_t gfp)
+  */
+ static void selinux_cred_free(struct cred *cred)
+ {
+-	struct task_security_struct *tsec = cred->security;
++	struct task_security_struct *tsec = selinux_cred(cred);
+ 
+ 	/*
+ 	 * cred->security == NULL if security_cred_alloc_blank() or
+@@ -3589,7 +3589,7 @@ static int selinux_cred_prepare(struct cred *new, const struct cred *old,
+ 	const struct task_security_struct *old_tsec;
+ 	struct task_security_struct *tsec;
+ 
+-	old_tsec = old->security;
++	old_tsec = selinux_cred(old);
+ 
+ 	tsec = kmemdup(old_tsec, sizeof(struct task_security_struct), gfp);
+ 	if (!tsec)
+@@ -3604,8 +3604,8 @@ static int selinux_cred_prepare(struct cred *new, const struct cred *old,
+  */
+ static void selinux_cred_transfer(struct cred *new, const struct cred *old)
+ {
+-	const struct task_security_struct *old_tsec = old->security;
+-	struct task_security_struct *tsec = new->security;
++	const struct task_security_struct *old_tsec = selinux_cred(old);
++	struct task_security_struct *tsec = selinux_cred(new);
+ 
+ 	*tsec = *old_tsec;
+ }
+@@ -3616,7 +3616,7 @@ static void selinux_cred_transfer(struct cred *new, const struct cred *old)
+  */
+ static int selinux_kernel_act_as(struct cred *new, u32 secid)
+ {
+-	struct task_security_struct *tsec = new->security;
++	struct task_security_struct *tsec = selinux_cred(new);
+ 	u32 sid = current_sid();
+ 	int ret;
+ 
+@@ -3639,8 +3639,8 @@ static int selinux_kernel_act_as(struct cred *new, u32 secid)
+  */
+ static int selinux_kernel_create_files_as(struct cred *new, struct inode *inode)
+ {
+-	struct inode_security_struct *isec = inode->i_security;
+-	struct task_security_struct *tsec = new->security;
++	struct inode_security_struct *isec = selinux_inode(inode);
++	struct task_security_struct *tsec = selinux_cred(new);
+ 	u32 sid = current_sid();
+ 	int ret;
+ 
+@@ -3687,7 +3687,7 @@ static int selinux_kernel_module_from_file(struct file *file)
+ 	ad.u.path = file->f_path;
+ 
+ 	inode = file_inode(file);
+-	isec = inode->i_security;
++	isec = selinux_inode(inode);
+ 	fsec = file->f_security;
+ 
+ 	if (sid != fsec->sid) {
+@@ -3791,7 +3791,7 @@ static int selinux_task_wait(struct task_struct *p)
+ static void selinux_task_to_inode(struct task_struct *p,
+ 				  struct inode *inode)
+ {
+-	struct inode_security_struct *isec = inode->i_security;
++	struct inode_security_struct *isec = selinux_inode(inode);
+ 	u32 sid = task_sid(p);
+ 
+ 	isec->sid = sid;
+@@ -4094,7 +4094,7 @@ static int sock_has_perm(struct task_struct *task, struct sock *sk, u32 perms)
+ static int selinux_socket_create(int family, int type,
+ 				 int protocol, int kern)
+ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	u32 newsid;
+ 	u16 secclass;
+ 	int rc;
+@@ -4113,7 +4113,7 @@ static int selinux_socket_create(int family, int type,
+ static int selinux_socket_post_create(struct socket *sock, int family,
+ 				      int type, int protocol, int kern)
+ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	struct inode_security_struct *isec = SOCK_INODE(sock)->i_security;
+ 	struct sk_security_struct *sksec;
+ 	int err = 0;
+@@ -4726,7 +4726,7 @@ static int selinux_secmark_relabel_packet(u32 sid)
+ 	const struct task_security_struct *__tsec;
+ 	u32 tsid;
+ 
+-	__tsec = current_security();
++	__tsec = selinux_cred(current_cred());
+ 	tsid = __tsec->sid;
+ 
+ 	return avc_has_perm(tsid, sid, SECCLASS_PACKET, PACKET__RELABELTO, NULL);
+@@ -5650,7 +5650,7 @@ static int selinux_getprocattr(struct task_struct *p,
+ 	}
+ 
+ 	rcu_read_lock();
+-	__tsec = __task_cred(p)->security;
++	__tsec = selinux_cred(__task_cred(p));
+ 
+ 	if (!strcmp(name, "current"))
+ 		sid = __tsec->sid;
+@@ -5759,7 +5759,7 @@ static int selinux_setprocattr(struct task_struct *p,
+ 	   operation.  See selinux_bprm_set_creds for the execve
+ 	   checks and may_create for the file creation checks. The
+ 	   operation will then fail if the context is not permitted. */
+-	tsec = new->security;
++	tsec = selinux_cred(new);
+ 	if (!strcmp(name, "exec")) {
+ 		tsec->exec_sid = sid;
+ 	} else if (!strcmp(name, "fscreate")) {
+@@ -5878,7 +5878,7 @@ static int selinux_key_alloc(struct key *k, const struct cred *cred,
+ 	if (!ksec)
+ 		return -ENOMEM;
+ 
+-	tsec = cred->security;
++	tsec = selinux_cred(cred);
+ 	if (tsec->keycreate_sid)
+ 		ksec->sid = tsec->keycreate_sid;
+ 	else
+@@ -126,4 +126,15 @@ struct key_security_struct {
+ 
+ extern unsigned int selinux_checkreqprot;
+ 
++static inline struct inode_security_struct *selinux_inode(
++						const struct inode *inode)
++{
++	return inode->i_security;
++}
++
++static inline struct task_security_struct *selinux_cred(const struct cred *cred)
++{
++	return cred->security;
++}
++
+ #endif /* _SELINUX_OBJSEC_H_ */
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index c02da25d..2c95f1dc 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -1242,7 +1242,7 @@ static int sel_make_bools(void)
+ 		if (len >= PAGE_SIZE)
+ 			goto out;
+ 
+-		isec = (struct inode_security_struct *)inode->i_security;
++		isec = selinux_inode(inode);
+ 		ret = security_genfs_sid("selinuxfs", page, SECCLASS_FILE, &sid);
+ 		if (ret)
+ 			goto out;
+@@ -1783,7 +1783,7 @@ static int sel_fill_super(struct super_block *sb, void *data, int silent)
+ 		goto err;
+ 
+ 	inode->i_ino = ++sel_last_ino;
+-	isec = (struct inode_security_struct *)inode->i_security;
++	isec = selinux_inode(inode);
+ 	isec->sid = SECINITSID_DEVNULL;
+ 	isec->sclass = SECCLASS_CHR_FILE;
+ 	isec->initialized = 1;
+diff --git a/security/selinux/xfrm.c b/security/selinux/xfrm.c
+index 56e354fc..789d07bd 100644
+--- a/security/selinux/xfrm.c
++++ b/security/selinux/xfrm.c
+@@ -79,7 +79,7 @@ static int selinux_xfrm_alloc_user(struct xfrm_sec_ctx **ctxp,
+ 				   gfp_t gfp)
+ {
+ 	int rc;
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 	struct xfrm_sec_ctx *ctx = NULL;
+ 	u32 str_len;
+ 
+@@ -136,7 +136,7 @@ static void selinux_xfrm_free(struct xfrm_sec_ctx *ctx)
+  */
+ static int selinux_xfrm_delete(struct xfrm_sec_ctx *ctx)
+ {
+-	const struct task_security_struct *tsec = current_security();
++	const struct task_security_struct *tsec = selinux_cred(current_cred());
+ 
+ 	if (!ctx)
+ 		return 0;
+BACKPORT_PATCH
+hd_check=$(git -C kernel apply --check ../build-logs/legacy-backports.patch 2>&1 || true)
+git -C kernel apply ../build-logs/legacy-backports.patch || echo "Patch applied with warnings/manually"
+git -C kernel diff > build-logs/kernel-changes.patch
+git -C kernel/KernelSU-Next diff > build-logs/ksu-compat.patch
+"
+    - name: Generate platina_defconfig and verify manual hook settings
+      shell: bash
+      run: |
+        set -euo pipefail
+        make -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64           CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump CROSS_COMPILE=aarch64-linux-android-           CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu-           "$DEFCONFIG" 2>&1 | tee build-logs/config.log
+        kernel/scripts/config --file kernel/out/.config           -e KSU -e KSU_NEXT -d KSU_DEBUG -d KSU_KPROBES_HOOK -d KSU_KPROBE_HOOKS           -d KSU_SYSCALL_TABLE_HOOK -d LTO -d LTO_CLANG -d THINLTO -e LTO_NONE
+        if grep -Eq '^[[:space:]]*config KSU_MANUAL_HOOK' kernel/KernelSU-Next/kernel/Kconfig; then
+          kernel/scripts/config --file kernel/out/.config -e KSU_MANUAL_HOOK
+        fi
+        make -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64           CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump CROSS_COMPILE=aarch64-linux-android-           CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu-           olddefconfig 2>&1 | tee -a build-logs/config.log
+        grep -qx 'CONFIG_KSU=y' kernel/out/.config
+        grep -qx 'CONFIG_KSU_NEXT=y' kernel/out/.config
+        echo '[OK] CONFIG_KSU=y dan CONFIG_KSU_NEXT=y berhasil diaktifkan!'
+        grep -E '^CONFIG_KSU|^# CONFIG_KSU' kernel/out/.config | tee build-logs/ksu-config.txt
+        grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' kernel/out/.config
+        grep -qx 'CONFIG_LTO_NONE=y' kernel/out/.config
+    - name: Compile SELinux, KernelSU Next, and the complete kernel
+      shell: bash
+      run: |
+        set -euo pipefail
+        args=( -C kernel O="$GITHUB_WORKSPACE/kernel/out" ARCH=arm64   CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump   CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-   CLANG_TRIPLE=aarch64-linux-gnu- )
+        make "${args[@]}" -j"$BUILD_JOBS" security/selinux/ 2>&1 | tee build-logs/selinux.log
+        make "${args[@]}" -j"$BUILD_JOBS" drivers/kernelsu/ 2>&1 | tee build-logs/ksu-objects.log
+        make "${args[@]}" -j"$BUILD_JOBS" Image.gz-dtb dtbs 2>&1 | tee build-logs/build.log
+        test -s kernel/out/arch/arm64/boot/Image.gz-dtb
+        test -s kernel/out/vmlinux
+        llvm-nm --defined-only kernel/out/vmlinux > build-logs/vmlinux-symbols.txt
+        for sym in kernelsu_init ksu_handle_execveat ksu_handle_sys_read ksu_handle_sys_reboot; do
+          grep -Eq "[[:space:]]${sym}$" build-logs/vmlinux-symbols.txt
+        done
+    - name: Package kernel files and checksums (not flashable)
+      if: success()
+      shell: bash
+      run: |
+        set -euo pipefail
+        cp kernel/out/arch/arm64/boot/Image.gz-dtb dist/Image.gz-dtb
+        cp kernel/out/.config dist/platina.config
+        cp build-logs/{kernel-commit.txt,ksu-commit.txt,clang-version.txt} dist/
+        ( cd dist && sha256sum Image.gz-dtb > SHA256SUMS )
+        zip -q -r "platina-ksunext-clang12-run${GITHUB_RUN_NUMBER}-NOT-FLASHABLE.zip" dist
+        {
+          echo '### Platina KernelSU Next build'
+          echo "- Kernel: FirmanBell/msm-4.4 ($KERNEL_BRANCH)"
+          echo "- Defconfig: $DEFCONFIG"
+          echo "- Compiler: $(head -n 1 build-logs/clang-version.txt)"
+          echo "- KernelSU ref: $(cat build-logs/ksu-commit.txt)"
+          echo '- Hook mode: manual; 64-bit and compat exec; safe-mode input hook'
+          echo '- Output: Image.gz-dtb (NOT directly flashable)'
+        } | tee build-logs/summary.txt >> "$GITHUB_STEP_SUMMARY"
+    - name: Summarize first build error (when failed)
+      if: failure()
+      shell: bash
+      run: "set -uo pipefail
+mkdir -p build-logs
+for log in build-logs/build.log build-logs/ksu-objects.log build-logs/selinux.log;        \ do
+  if [[ -s "$log" ]] && grep -Eiq 'fatal error:|error:|undefined reference|Error [0-9]+' "$log"        ; then
+    cp "$log" build-logs/failure.log
+    break
+  fi
+done
+if [[ -s build-logs/failure.log ]];        \ then
+  echo '=== First relevant compiler and linker errors ==='
+  grep -Enim 20 'fatal error:|(^|[[:space:]])error:|undefined        \ reference|No rule to make target|ld.lld: error:|clang: error:' \
+    build-logs/failure.log | tee build-logs/first-errors.txt        \ || true
+  first_line="$(grep -Enim 1 'fatal error:|(^|[[:space:]])error:|undefined reference|No rule        \ to make target|ld.lld: error:|clang: error:' \
+    build-logs/failure.log | cut -d: -f1 || true)"
+        \  if [[ -n "$first_line" ]]; then
+    start=$(( first_line > 8 ? first_line - 8 : 1 ))
+    end=$Package        \ first_line + 22 
+    echo '=== Context of first error ==='
+    sed -n "${start},${end}p" build-logs/failure.log        \ | tee build-logs/first-error-context.txt
+    {
+      echo '### Kernel build failed — first diagnostic'
+              echo '```text'
+      cat build-logs/first-error-context.txt
+      echo '```'
+    } >> "$GITHUB_STEP_SUMMARY"
+          else
+    echo 'No compiler/linker error token found in build.log.' | tee build-logs/first-errors.txt
+          fi
+else
+  echo 'Build log was not created; failure occurred before kernel compilation.' | tee build-logs/first-errors.txt
+        fi
+"
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: platina-ksunext-clang12-logs-${{ github.run_number }}
+        if-no-files-found: ignore
+        retention-days: 14
+        path: |
+          build-logs/
+          kernel/out/.config
+    - name: Upload compiled kernel
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: platina-ksunext-clang12-kernel-${{ github.run_number }}
+        if-no-files-found: error
+        retention-days: 14
+        path: |
+          dist/
+on:
+  workflow_dispatch:
+    inputs:
+      build_jobs:
+        description: Number of parallel jobs (2 recommended for GitHub-hosted runners)
+        required: true
+        default: '2'
+        type: choice
+        options:
+        - '1'
+        - '2'
+        - '3'
+        - '4'
