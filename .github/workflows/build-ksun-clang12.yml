@@ -111,7 +111,7 @@ jobs:
       run: "set -euo pipefail\nmkdir -p build-logs\nexec > >(tee build-logs/ksu-hooks.log) 2>&1\ngit clone https://github.com/KernelSU-Next/KernelSU-Next.git\
         \ kernel/KernelSU-Next\ngit -C kernel/KernelSU-Next checkout --detach \"$KSU_REF\"\ntest \"$(git -C kernel/KernelSU-Next\
         \ rev-parse HEAD)\" = \"$KSU_REF\"\ngit -C kernel/KernelSU-Next rev-parse HEAD | tee build-logs/ksu-commit.txt\n\
-        python3 - kernel <<'INTEGRATE_PY'\n#!/usr/bin/env python3\n\"\"\"Integrate a checked-out KernelSU Next release\
+        python3 - kernel <<'INTEGRATE_PY'\n#!/usr/bin/env python3\n\"\"\"Integrate a checked-out KernelSU Next legacy\
         \ tree into a Linux kernel.\n\nRun from the CI working directory after cloning kernel/KernelSU-Next.\nOnly\
         \ changes drivers/Kconfig, drivers/Makefile, drivers/kernelsu symlink.\n\"\"\"\nimport os\nfrom pathlib\
         \ import Path\nimport sys\n\n\ndef integrate(kernel: Path) -> None:\n    kernel = kernel.resolve()\n   \
