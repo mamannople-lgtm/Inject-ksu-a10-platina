@@ -11,6 +11,7 @@ jobs:
     env:
       ARCH: arm64
       SUBARCH: arm64
+      KBUILD_LOCALVERSION: Delaiya+
       KBUILD_BUILD_USER: ISAL
       KBUILD_BUILD_HOST: LocalEmpty
       KERNEL_REPO: https://github.com/FirmanBell/msm-4.4.git
