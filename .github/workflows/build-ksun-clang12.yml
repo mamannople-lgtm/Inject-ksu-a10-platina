@@ -405,7 +405,7 @@ jobs:
         grep -E '^CONFIG_KSU|^# CONFIG_KSU' kernel/out/.config | tee build-logs/ksu-config.txt
         grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' kernel/out/.config
         grep -qx 'CONFIG_LTO_NONE=y' kernel/out/.config
-        grep -qx 'CONFIG_LOCALVERSION="Delaiya+"' kernel/out/.config
+        grep -qx 'CONFIG_LOCALVERSION="-Deliya+"' kernel/out/.config
         grep -qx '# CONFIG_LOCALVERSION_AUTO is not set' kernel/out/.config
     - name: Compile SELinux, KernelSU Next, and the complete kernel
       shell: bash
@@ -439,7 +439,7 @@ jobs:
         done
         grep -qx '#define LINUX_COMPILE_BY "LocalEmpty"' kernel/out/include/generated/compile.h
         grep -qx '#define LINUX_COMPILE_HOST "LocalEmpty"' kernel/out/include/generated/compile.h
-        grep -qx '4.4.228Delaiya+' kernel/out/include/config/kernel.release
+        grep -qx '4.4.228-Deliya+' kernel/out/include/config/kernel.release
         cp kernel/out/include/generated/compile.h build-logs/compile.h
         cp kernel/out/include/config/kernel.release build-logs/kernel.release
     - name: Package AnyKernel3 flashable ZIP and raw kernel files
@@ -459,7 +459,7 @@ jobs:
         ### AnyKernel3 Ramdisk Mod Script
         ## osm0sis @ xda-developers
         properties() { '
-        kernel.string=Delaiya+ Platina KernelSU-Next legacy 33314 (Clang 12)
+        kernel.string=-Deliya+ Platina KernelSU-Next legacy 33314 (Clang 12)
         do.devicecheck=1
         do.modules=0
         do.systemless=1
@@ -484,11 +484,11 @@ jobs:
         AK3_SH
         (
           cd AnyKernel3
-          zip -q -r9 "$GITHUB_WORKSPACE/dist/platina-Delaiya-plus-ksunext33314-AnyKernel3.zip" . -x '*.git*' 'README.md' '*placeholder*'
+          zip -q -r9 "$GITHUB_WORKSPACE/dist/platina-Deliya-plus-ksunext33314-AnyKernel3.zip" . -x '*.git*' 'README.md' '*placeholder*'
         )
         (
           cd dist
-          sha256sum Image.gz-dtb platina-Delaiya-plus-ksunext33314-AnyKernel3.zip > SHA256SUMS
+          sha256sum Image.gz-dtb platina-Deliya-plus-ksunext33314-AnyKernel3.zip > SHA256SUMS
         )
         {
           echo '### Platina KernelSU Next build'
