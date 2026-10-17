@@ -207,95 +207,105 @@ jobs:
         \ rather than an unrelated stock config.\np=kernel/'kernel/Makefile'\ns=p.read_text()\nold='$(obj)/config_data.gz:\
         \ arch/arm64/configs/platina-stock_defconfig FORCE'\nnew='$(obj)/config_data.gz: .config FORCE'\nif old in s:\n  \
         \  assert s.count(old)==1\n    p.write_text(s.replace(old,new,1))\n    print('[COMPAT] IKCONFIG: embed the actual\
-        \ build configuration')\nelse:\n    assert new in s\nCOMPAT_PY\ncat > build-logs/legacy-backports.patch <<'BACKPORT_PATCH'\n\
-        diff --git a/fs/internal.h b/fs/internal.h\nindex 0ec68117..788e4a0b 100644\n--- a/fs/internal.h\n+++ b/fs/internal.h\n\
-        @@ -64,6 +64,7 @@ extern int finish_automount(struct vfsmount *, struct path *);\n extern int sb_prepare_remount_readonly(struct\
-        \ super_block *);\n \n extern void __init mnt_init(void);\n+int path_umount(struct path *path, int flags);\n \n extern\
-        \ int __mnt_want_write(struct vfsmount *);\n extern int __mnt_want_write_file(struct file *);\ndiff --git a/fs/namespace.c\
-        \ b/fs/namespace.c\nindex edeb8b9c..d8a0b500 100644\n--- a/fs/namespace.c\n+++ b/fs/namespace.c\n@@ -1734,6 +1734,36\
-        \ @@ SYSCALL_DEFINE1(oldumount, char __user *, name)\n \n #endif\n \n+static int can_umount(const struct path *path,\
-        \ int flags)\n+ {\n+\t struct mount *mnt = real_mount(path->mnt);\n+\t if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE\
-        \ | UMOUNT_NOFOLLOW))\n+\t\t return -EINVAL;\n+\t if (!may_mount())\n+\t\t return -EPERM;\n+\t if (path->dentry !=\
-        \ path->mnt->mnt_root)\n+\t\t return -EINVAL;\n+\t if (!check_mnt(mnt))\n+\t\t return -EINVAL;\n+\t if (mnt->mnt.mnt_flags\
-        \ & MNT_LOCKED)\n+\t\t return -EINVAL;\n+\t if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n+\t\t return -EPERM;\n\
-        +\t return 0;\n+ }\n+\n+int path_umount(struct path *path, int flags)\n+ {\n+\t struct mount *mnt = real_mount(path->mnt);\n\
-        +\t int ret;\n+\t ret = can_umount(path, flags);\n+\t if (!ret)\n+\t\t ret = do_umount(mnt, flags);\n+\t dput(path->dentry);\n\
-        +\t mntput_no_expire(mnt);\n+\t return ret;\n+ }\n+\n static bool is_mnt_ns_file(struct dentry *dentry)\n {\n \t/*\
-        \ Is this a proxy for a mount namespace? */\ndiff --git a/include/linux/seccomp.h b/include/linux/seccomp.h\nindex\
-        \ 50c460a9..0fe69924 100644\n--- a/include/linux/seccomp.h\n+++ b/include/linux/seccomp.h\n@@ -9,6 +9,7 @@\n #ifdef\
-        \ CONFIG_SECCOMP\n \n #include <linux/thread_info.h>\n+#include <linux/atomic.h>\n #include <asm/seccomp.h>\n \n struct\
-        \ seccomp_filter;\n@@ -25,6 +26,7 @@ struct seccomp_filter;\n  */\n struct seccomp {\n \tint mode;\n+\tatomic_t filter_count;\n\
-        \ \tstruct seccomp_filter *filter;\n };\n \ndiff --git a/security/selinux/hooks.c b/security/selinux/hooks.c\nindex\
-        \ ae330968..b475bd6f 100644\n--- a/security/selinux/hooks.c\n+++ b/security/selinux/hooks.c\n@@ -193,7 +193,7 @@ static\
-        \ inline u32 cred_sid(const struct cred *cred)\n {\n \tconst struct task_security_struct *tsec;\n \n-\ttsec = cred->security;\n\
-        +\ttsec = selinux_cred(cred);\n \treturn tsec->sid;\n }\n \n@@ -215,7 +215,7 @@ static inline u32 task_sid(const struct\
-        \ task_struct *task)\n  */\n static inline u32 current_sid(void)\n {\n-\tconst struct task_security_struct *tsec =\
-        \ current_security();\n+\tconst struct task_security_struct *tsec = selinux_cred(current_cred());\n \n \treturn tsec->sid;\n\
-        \ }\n@@ -252,7 +252,7 @@ static void inode_free_rcu(struct rcu_head *head)\n \n static void inode_free_security(struct\
-        \ inode *inode)\n {\n-\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct inode_security_struct *isec\
-        \ = selinux_inode(inode);\n \tstruct superblock_security_struct *sbsec = inode->i_sb->s_security;\n \n \t/*\n@@ -367,7\
-        \ +367,7 @@ static int may_context_mount_sb_relabel(u32 sid,\n \t\t\tstruct superblock_security_struct *sbsec,\n \t\
-        \t\tconst struct cred *cred)\n {\n-\tconst struct task_security_struct *tsec = cred->security;\n+\tconst struct task_security_struct\
-        \ *tsec = selinux_cred(cred);\n \tint rc;\n \n \trc = avc_has_perm(tsec->sid, sbsec->sid, SECCLASS_FILESYSTEM,\n@@\
-        \ -384,7 +384,7 @@ static int may_context_mount_inode_relabel(u32 sid,\n \t\t\tstruct superblock_security_struct *sbsec,\n\
-        \ \t\t\tconst struct cred *cred)\n {\n-\tconst struct task_security_struct *tsec = cred->security;\n+\tconst struct\
-        \ task_security_struct *tsec = selinux_cred(cred);\n \tint rc;\n \trc = avc_has_perm(tsec->sid, sbsec->sid, SECCLASS_FILESYSTEM,\n\
-        \ \t\t\t  FILESYSTEM__RELABELFROM, NULL);\n@@ -1295,7 +1295,7 @@ static int selinux_genfs_get_sid(struct dentry *dentry,\n\
-        \ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)\n {\n \tstruct superblock_security_struct\
-        \ *sbsec = NULL;\n-\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct inode_security_struct *isec\
-        \ = selinux_inode(inode);\n \tu32 sid;\n \tstruct dentry *dentry;\n #define INITCONTEXTLEN 255\n@@ -1633,7 +1633,7\
-        \ @@ static int inode_has_perm(const struct cred *cred,\n \t\treturn 0;\n \n \tsid = cred_sid(cred);\n-\tisec = inode->i_security;\n\
-        +\tisec = selinux_inode(inode);\n \n \treturn avc_has_perm(sid, isec->sid, isec->sclass, perms, adp);\n }\n@@ -1729,7\
-        \ +1729,7 @@ static int selinux_determine_inode_label(const struct inode *dir,\n {\n \tconst struct superblock_security_struct\
-        \ *sbsec = dir->i_sb->s_security;\n \tconst struct inode_security_struct *dsec = dir->i_security;\n-\tconst struct\
-        \ task_security_struct *tsec = current_security();\n+\tconst struct task_security_struct *tsec = selinux_cred(current_cred());\n\
-        \ \n \tif ((sbsec->flags & SE_SBINITIALIZED) &&\n \t    (sbsec->behavior == SECURITY_FS_USE_MNTPOINT)) {\n@@ -1750,7\
-        \ +1750,7 @@ static int may_create(struct inode *dir,\n \t\t      struct dentry *dentry,\n \t\t      u16 tclass)\n\
+        \ build configuration')\nelse:\n    assert new in s\n# Linux 4.4 owns latest_granting globally, before struct selinux_state\
+        \ existed.\np = ksu / 'selinux/rules.c'\ns = p.read_text()\nold = 'u32 seqno = selinux_state.ss ? ++selinux_state.ss->latest_granting\
+        \ : 1;'\nassert s.count(old) == 1\ns = s.replace(old, 'u32 seqno = ksu_legacy_next_policy_seqno();')\np.write_text(s)\n\
+        p = kernel / 'security/selinux/ss/services.c'\ns = p.read_text()\nanchor = 'static u32 latest_granting;'\nassert s.count(anchor)\
+        \ == 1\ns = s.replace(anchor, anchor + '''\n#ifdef CONFIG_KSU\nu32 ksu_legacy_next_policy_seqno(void)\n{\n    u32\
+        \ seqno;\n    write_lock_irq(&policy_rwlock);\n    seqno = ++latest_granting;\n    write_unlock_irq(&policy_rwlock);\n\
+        \    return seqno;\n}\n#endif\n''')\np.write_text(s)\np = kernel / 'security/selinux/include/security.h'\ns = p.read_text()\n\
+        anchor = 'extern void selinux_status_update_policyload(int seqno);'\nassert s.count(anchor) == 1\ns = s.replace(anchor,\
+        \ anchor + '\\n#ifdef CONFIG_KSU\\nu32 ksu_legacy_next_policy_seqno(void);\\n#endif')\np.write_text(s)\nprint('[COMPAT]\
+        \ SELinux policy sequence counter uses Linux 4.4 policy lock')\nCOMPAT_PY\ncat > build-logs/legacy-backports.patch\
+        \ <<'BACKPORT_PATCH'\ndiff --git a/fs/internal.h b/fs/internal.h\nindex 0ec68117..788e4a0b 100644\n--- a/fs/internal.h\n\
+        +++ b/fs/internal.h\n@@ -64,6 +64,7 @@ extern int finish_automount(struct vfsmount *, struct path *);\n extern int\
+        \ sb_prepare_remount_readonly(struct super_block *);\n \n extern void __init mnt_init(void);\n+int path_umount(struct\
+        \ path *path, int flags);\n \n extern int __mnt_want_write(struct vfsmount *);\n extern int __mnt_want_write_file(struct\
+        \ file *);\ndiff --git a/fs/namespace.c b/fs/namespace.c\nindex edeb8b9c..d8a0b500 100644\n--- a/fs/namespace.c\n\
+        +++ b/fs/namespace.c\n@@ -1734,6 +1734,36 @@ SYSCALL_DEFINE1(oldumount, char __user *, name)\n \n #endif\n \n+static\
+        \ int can_umount(const struct path *path, int flags)\n+ {\n+\t struct mount *mnt = real_mount(path->mnt);\n+\t if\
+        \ (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n+\t\t return -EINVAL;\n+\t if (!may_mount())\n\
+        +\t\t return -EPERM;\n+\t if (path->dentry != path->mnt->mnt_root)\n+\t\t return -EINVAL;\n+\t if (!check_mnt(mnt))\n\
+        +\t\t return -EINVAL;\n+\t if (mnt->mnt.mnt_flags & MNT_LOCKED)\n+\t\t return -EINVAL;\n+\t if (flags & MNT_FORCE\
+        \ && !capable(CAP_SYS_ADMIN))\n+\t\t return -EPERM;\n+\t return 0;\n+ }\n+\n+int path_umount(struct path *path, int\
+        \ flags)\n+ {\n+\t struct mount *mnt = real_mount(path->mnt);\n+\t int ret;\n+\t ret = can_umount(path, flags);\n\
+        +\t if (!ret)\n+\t\t ret = do_umount(mnt, flags);\n+\t dput(path->dentry);\n+\t mntput_no_expire(mnt);\n+\t return\
+        \ ret;\n+ }\n+\n static bool is_mnt_ns_file(struct dentry *dentry)\n {\n \t/* Is this a proxy for a mount namespace?\
+        \ */\ndiff --git a/include/linux/seccomp.h b/include/linux/seccomp.h\nindex 50c460a9..0fe69924 100644\n--- a/include/linux/seccomp.h\n\
+        +++ b/include/linux/seccomp.h\n@@ -9,6 +9,7 @@\n #ifdef CONFIG_SECCOMP\n \n #include <linux/thread_info.h>\n+#include\
+        \ <linux/atomic.h>\n #include <asm/seccomp.h>\n \n struct seccomp_filter;\n@@ -25,6 +26,7 @@ struct seccomp_filter;\n\
+        \  */\n struct seccomp {\n \tint mode;\n+\tatomic_t filter_count;\n \tstruct seccomp_filter *filter;\n };\n \ndiff\
+        \ --git a/security/selinux/hooks.c b/security/selinux/hooks.c\nindex ae330968..b475bd6f 100644\n--- a/security/selinux/hooks.c\n\
+        +++ b/security/selinux/hooks.c\n@@ -193,7 +193,7 @@ static inline u32 cred_sid(const struct cred *cred)\n {\n \tconst\
+        \ struct task_security_struct *tsec;\n \n-\ttsec = cred->security;\n+\ttsec = selinux_cred(cred);\n \treturn tsec->sid;\n\
+        \ }\n \n@@ -215,7 +215,7 @@ static inline u32 task_sid(const struct task_struct *task)\n  */\n static inline u32 current_sid(void)\n\
         \ {\n-\tconst struct task_security_struct *tsec = current_security();\n+\tconst struct task_security_struct *tsec\
-        \ = selinux_cred(current_cred());\n \tstruct inode_security_struct *dsec;\n \tstruct superblock_security_struct *sbsec;\n\
-        \ \tu32 sid, newsid;\n@@ -2022,7 +2022,7 @@ static int selinux_binder_transfer_file(struct task_struct *from,\n \t\
-        u32 sid = task_sid(to);\n \tstruct file_security_struct *fsec = file->f_security;\n \tstruct inode *inode = d_backing_inode(file->f_path.dentry);\n\
-        -\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n\
-        \ \tstruct common_audit_data ad;\n \tint rc;\n \n@@ -2225,9 +2225,9 @@ static int selinux_bprm_set_creds(struct linux_binprm\
-        \ *bprm)\n \tif (bprm->cred_prepared)\n \t\treturn 0;\n \n-\told_tsec = current_security();\n-\tnew_tsec = bprm->cred->security;\n\
-        -\tisec = inode->i_security;\n+\told_tsec = selinux_cred(current_cred());\n+\tnew_tsec = selinux_cred(bprm->cred);\n\
-        +\tisec = selinux_inode(inode);\n \n \t/* Default to the current task SID. */\n \tnew_tsec->sid = old_tsec->sid;\n\
-        @@ -2327,7 +2327,7 @@ static int selinux_bprm_set_creds(struct linux_binprm *bprm)\n \n static int selinux_bprm_secureexec(struct\
+        \ = selinux_cred(current_cred());\n \n \treturn tsec->sid;\n }\n@@ -252,7 +252,7 @@ static void inode_free_rcu(struct\
+        \ rcu_head *head)\n \n static void inode_free_security(struct inode *inode)\n {\n-\tstruct inode_security_struct *isec\
+        \ = inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n \tstruct superblock_security_struct\
+        \ *sbsec = inode->i_sb->s_security;\n \n \t/*\n@@ -367,7 +367,7 @@ static int may_context_mount_sb_relabel(u32 sid,\n\
+        \ \t\t\tstruct superblock_security_struct *sbsec,\n \t\t\tconst struct cred *cred)\n {\n-\tconst struct task_security_struct\
+        \ *tsec = cred->security;\n+\tconst struct task_security_struct *tsec = selinux_cred(cred);\n \tint rc;\n \n \trc\
+        \ = avc_has_perm(tsec->sid, sbsec->sid, SECCLASS_FILESYSTEM,\n@@ -384,7 +384,7 @@ static int may_context_mount_inode_relabel(u32\
+        \ sid,\n \t\t\tstruct superblock_security_struct *sbsec,\n \t\t\tconst struct cred *cred)\n {\n-\tconst struct task_security_struct\
+        \ *tsec = cred->security;\n+\tconst struct task_security_struct *tsec = selinux_cred(cred);\n \tint rc;\n \trc = avc_has_perm(tsec->sid,\
+        \ sbsec->sid, SECCLASS_FILESYSTEM,\n \t\t\t  FILESYSTEM__RELABELFROM, NULL);\n@@ -1295,7 +1295,7 @@ static int selinux_genfs_get_sid(struct\
+        \ dentry *dentry,\n static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)\n {\n \tstruct\
+        \ superblock_security_struct *sbsec = NULL;\n-\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct\
+        \ inode_security_struct *isec = selinux_inode(inode);\n \tu32 sid;\n \tstruct dentry *dentry;\n #define INITCONTEXTLEN\
+        \ 255\n@@ -1633,7 +1633,7 @@ static int inode_has_perm(const struct cred *cred,\n \t\treturn 0;\n \n \tsid = cred_sid(cred);\n\
+        -\tisec = inode->i_security;\n+\tisec = selinux_inode(inode);\n \n \treturn avc_has_perm(sid, isec->sid, isec->sclass,\
+        \ perms, adp);\n }\n@@ -1729,7 +1729,7 @@ static int selinux_determine_inode_label(const struct inode *dir,\n {\n\
+        \ \tconst struct superblock_security_struct *sbsec = dir->i_sb->s_security;\n \tconst struct inode_security_struct\
+        \ *dsec = dir->i_security;\n-\tconst struct task_security_struct *tsec = current_security();\n+\tconst struct task_security_struct\
+        \ *tsec = selinux_cred(current_cred());\n \n \tif ((sbsec->flags & SE_SBINITIALIZED) &&\n \t    (sbsec->behavior ==\
+        \ SECURITY_FS_USE_MNTPOINT)) {\n@@ -1750,7 +1750,7 @@ static int may_create(struct inode *dir,\n \t\t      struct\
+        \ dentry *dentry,\n \t\t      u16 tclass)\n {\n-\tconst struct task_security_struct *tsec = current_security();\n\
+        +\tconst struct task_security_struct *tsec = selinux_cred(current_cred());\n \tstruct inode_security_struct *dsec;\n\
+        \ \tstruct superblock_security_struct *sbsec;\n \tu32 sid, newsid;\n@@ -2022,7 +2022,7 @@ static int selinux_binder_transfer_file(struct\
+        \ task_struct *from,\n \tu32 sid = task_sid(to);\n \tstruct file_security_struct *fsec = file->f_security;\n \tstruct\
+        \ inode *inode = d_backing_inode(file->f_path.dentry);\n-\tstruct inode_security_struct *isec = inode->i_security;\n\
+        +\tstruct inode_security_struct *isec = selinux_inode(inode);\n \tstruct common_audit_data ad;\n \tint rc;\n \n@@\
+        \ -2225,9 +2225,9 @@ static int selinux_bprm_set_creds(struct linux_binprm *bprm)\n \tif (bprm->cred_prepared)\n \t\
+        \treturn 0;\n \n-\told_tsec = current_security();\n-\tnew_tsec = bprm->cred->security;\n-\tisec = inode->i_security;\n\
+        +\told_tsec = selinux_cred(current_cred());\n+\tnew_tsec = selinux_cred(bprm->cred);\n+\tisec = selinux_inode(inode);\n\
+        \ \n \t/* Default to the current task SID. */\n \tnew_tsec->sid = old_tsec->sid;\n@@ -2327,7 +2327,7 @@ static int\
+        \ selinux_bprm_set_creds(struct linux_binprm *bprm)\n \n static int selinux_bprm_secureexec(struct linux_binprm *bprm)\n\
+        \ {\n-\tconst struct task_security_struct *tsec = current_security();\n+\tconst struct task_security_struct *tsec\
+        \ = selinux_cred(current_cred());\n \tu32 sid, osid;\n \tint atsecure = 0;\n \n@@ -2409,7 +2409,7 @@ static void selinux_bprm_committing_creds(struct\
+        \ linux_binprm *bprm)\n \tstruct rlimit *rlim, *initrlim;\n \tint rc, i;\n \n-\tnew_tsec = bprm->cred->security;\n\
+        +\tnew_tsec = selinux_cred(bprm->cred);\n \tif (new_tsec->sid == new_tsec->osid)\n \t\treturn;\n \n@@ -2450,7 +2450,7\
+        \ @@ static void selinux_bprm_committing_creds(struct linux_binprm *bprm)\n  */\n static void selinux_bprm_committed_creds(struct\
         \ linux_binprm *bprm)\n {\n-\tconst struct task_security_struct *tsec = current_security();\n+\tconst struct task_security_struct\
-        \ *tsec = selinux_cred(current_cred());\n \tu32 sid, osid;\n \tint atsecure = 0;\n \n@@ -2409,7 +2409,7 @@ static\
-        \ void selinux_bprm_committing_creds(struct linux_binprm *bprm)\n \tstruct rlimit *rlim, *initrlim;\n \tint rc, i;\n\
-        \ \n-\tnew_tsec = bprm->cred->security;\n+\tnew_tsec = selinux_cred(bprm->cred);\n \tif (new_tsec->sid == new_tsec->osid)\n\
-        \ \t\treturn;\n \n@@ -2450,7 +2450,7 @@ static void selinux_bprm_committing_creds(struct linux_binprm *bprm)\n  */\n\
-        \ static void selinux_bprm_committed_creds(struct linux_binprm *bprm)\n {\n-\tconst struct task_security_struct *tsec\
-        \ = current_security();\n+\tconst struct task_security_struct *tsec = selinux_cred(current_cred());\n \tstruct itimerval\
-        \ itimer;\n \tu32 osid, sid;\n \tint rc, i;\n@@ -2762,7 +2762,7 @@ static int selinux_inode_init_security(struct inode\
-        \ *inode, struct inode *dir,\n \t\t\t\t       const char **name,\n \t\t\t\t       void **value, size_t *len)\n {\n\
-        -\tconst struct task_security_struct *tsec = current_security();\n+\tconst struct task_security_struct *tsec = selinux_cred(current_cred());\n\
-        \ \tstruct inode_security_struct *dsec;\n \tstruct superblock_security_struct *sbsec;\n \tu32 sid, newsid, clen;\n\
-        @@ -2784,7 +2784,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,\n \n \t/* Possibly\
-        \ defer initialization to selinux_complete_init. */\n \tif (sbsec->flags & SE_SBINITIALIZED) {\n-\t\tstruct inode_security_struct\
-        \ *isec = inode->i_security;\n+\t\tstruct inode_security_struct *isec = selinux_inode(inode);\n \t\tisec->sclass =\
-        \ inode_mode_to_security_class(inode->i_mode);\n \t\tisec->sid = newsid;\n \t\tisec->initialized = 1;\n@@ -2868,7\
-        \ +2868,7 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,\n \tad.type = LSM_AUDIT_DATA_DENTRY;\n\
-        \ \tad.u.dentry = dentry;\n \tsid = cred_sid(cred);\n-\tisec = inode->i_security;\n+\tisec = selinux_inode(inode);\n\
-        \ \n \treturn avc_has_perm_flags(sid, isec->sid, isec->sclass, FILE__READ, &ad,\n \t\t\t\t  rcu ? MAY_NOT_BLOCK :\
-        \ 0);\n@@ -2881,7 +2881,7 @@ static noinline int audit_inode_permission(struct inode *inode,\n {\n #ifdef CONFIG_AUDIT\n\
-        \ \tstruct common_audit_data ad;\n-\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct inode_security_struct\
-        \ *isec = selinux_inode(inode);\n \tint rc;\n \n \tad.type = LSM_AUDIT_DATA_INODE;\n@@ -2922,7 +2922,7 @@ static int\
-        \ selinux_inode_permission(struct inode *inode, int mask)\n \tperms = file_mask_to_av(inode->i_mode, mask);\n \n \t\
-        sid = cred_sid(cred);\n-\tisec = inode->i_security;\n+\tisec = selinux_inode(inode);\n \n \trc = avc_has_perm_noaudit(sid,\
-        \ isec->sid, isec->sclass, perms, 0, &avd);\n \taudited = avc_audit_required(perms, &avd, rc,\n@@ -2995,7 +2995,7\
-        \ @@ static int selinux_inode_setxattr(struct dentry *dentry, const char *name,\n \t\t\t\t  const void *value, size_t\
-        \ size, int flags)\n {\n \tstruct inode *inode = d_backing_inode(dentry);\n-\tstruct inode_security_struct *isec =\
-        \ inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n \tstruct superblock_security_struct\
-        \ *sbsec;\n \tstruct common_audit_data ad;\n \tu32 newsid, sid = current_sid();\n@@ -3072,7 +3072,7 @@ static void\
-        \ selinux_inode_post_setxattr(struct dentry *dentry, const char *name,\n \t\t\t\t\tint flags)\n {\n \tstruct inode\
-        \ *inode = d_backing_inode(dentry);\n-\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct inode_security_struct\
-        \ *isec = selinux_inode(inode);\n \tu32 newsid;\n \tint rc;\n \n@@ -3130,7 +3130,7 @@ static int selinux_inode_getsecurity(const\
-        \ struct inode *inode, const char *name\n \tu32 size;\n \tint error;\n \tchar *context = NULL;\n-\tstruct inode_security_struct\
-        \ *isec = inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n \n \tif (strcmp(name,\
-        \ XATTR_SELINUX_SUFFIX))\n \t\treturn -EOPNOTSUPP;\n@@ -3169,7 +3169,7 @@ out_nofree:\n static int selinux_inode_setsecurity(struct\
-        \ inode *inode, const char *name,\n \t\t\t\t     const void *value, size_t size, int flags)\n {\n-\tstruct inode_security_struct\
+        \ *tsec = selinux_cred(current_cred());\n \tstruct itimerval itimer;\n \tu32 osid, sid;\n \tint rc, i;\n@@ -2762,7\
+        \ +2762,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,\n \t\t\t\t       const\
+        \ char **name,\n \t\t\t\t       void **value, size_t *len)\n {\n-\tconst struct task_security_struct *tsec = current_security();\n\
+        +\tconst struct task_security_struct *tsec = selinux_cred(current_cred());\n \tstruct inode_security_struct *dsec;\n\
+        \ \tstruct superblock_security_struct *sbsec;\n \tu32 sid, newsid, clen;\n@@ -2784,7 +2784,7 @@ static int selinux_inode_init_security(struct\
+        \ inode *inode, struct inode *dir,\n \n \t/* Possibly defer initialization to selinux_complete_init. */\n \tif (sbsec->flags\
+        \ & SE_SBINITIALIZED) {\n-\t\tstruct inode_security_struct *isec = inode->i_security;\n+\t\tstruct inode_security_struct\
+        \ *isec = selinux_inode(inode);\n \t\tisec->sclass = inode_mode_to_security_class(inode->i_mode);\n \t\tisec->sid\
+        \ = newsid;\n \t\tisec->initialized = 1;\n@@ -2868,7 +2868,7 @@ static int selinux_inode_follow_link(struct dentry\
+        \ *dentry, struct inode *inode,\n \tad.type = LSM_AUDIT_DATA_DENTRY;\n \tad.u.dentry = dentry;\n \tsid = cred_sid(cred);\n\
+        -\tisec = inode->i_security;\n+\tisec = selinux_inode(inode);\n \n \treturn avc_has_perm_flags(sid, isec->sid, isec->sclass,\
+        \ FILE__READ, &ad,\n \t\t\t\t  rcu ? MAY_NOT_BLOCK : 0);\n@@ -2881,7 +2881,7 @@ static noinline int audit_inode_permission(struct\
+        \ inode *inode,\n {\n #ifdef CONFIG_AUDIT\n \tstruct common_audit_data ad;\n-\tstruct inode_security_struct *isec\
+        \ = inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n \tint rc;\n \n \tad.type =\
+        \ LSM_AUDIT_DATA_INODE;\n@@ -2922,7 +2922,7 @@ static int selinux_inode_permission(struct inode *inode, int mask)\n\
+        \ \tperms = file_mask_to_av(inode->i_mode, mask);\n \n \tsid = cred_sid(cred);\n-\tisec = inode->i_security;\n+\t\
+        isec = selinux_inode(inode);\n \n \trc = avc_has_perm_noaudit(sid, isec->sid, isec->sclass, perms, 0, &avd);\n \t\
+        audited = avc_audit_required(perms, &avd, rc,\n@@ -2995,7 +2995,7 @@ static int selinux_inode_setxattr(struct dentry\
+        \ *dentry, const char *name,\n \t\t\t\t  const void *value, size_t size, int flags)\n {\n \tstruct inode *inode =\
+        \ d_backing_inode(dentry);\n-\tstruct inode_security_struct *isec = inode->i_security;\n+\tstruct inode_security_struct\
+        \ *isec = selinux_inode(inode);\n \tstruct superblock_security_struct *sbsec;\n \tstruct common_audit_data ad;\n \t\
+        u32 newsid, sid = current_sid();\n@@ -3072,7 +3072,7 @@ static void selinux_inode_post_setxattr(struct dentry *dentry,\
+        \ const char *name,\n \t\t\t\t\tint flags)\n {\n \tstruct inode *inode = d_backing_inode(dentry);\n-\tstruct inode_security_struct\
+        \ *isec = inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n \tu32 newsid;\n \tint\
+        \ rc;\n \n@@ -3130,7 +3130,7 @@ static int selinux_inode_getsecurity(const struct inode *inode, const char *name\n\
+        \ \tu32 size;\n \tint error;\n \tchar *context = NULL;\n-\tstruct inode_security_struct *isec = inode->i_security;\n\
+        +\tstruct inode_security_struct *isec = selinux_inode(inode);\n \n \tif (strcmp(name, XATTR_SELINUX_SUFFIX))\n \t\t\
+        return -EOPNOTSUPP;\n@@ -3169,7 +3169,7 @@ out_nofree:\n static int selinux_inode_setsecurity(struct inode *inode,\
+        \ const char *name,\n \t\t\t\t     const void *value, size_t size, int flags)\n {\n-\tstruct inode_security_struct\
         \ *isec = inode->i_security;\n+\tstruct inode_security_struct *isec = selinux_inode(inode);\n \tu32 newsid;\n \tint\
         \ rc;\n \n@@ -3199,7 +3199,7 @@ static int selinux_inode_listsecurity(struct inode *inode, char *buffer, size_t\n\
         \ \n static void selinux_inode_getsecid(const struct inode *inode, u32 *secid)\n {\n-\tstruct inode_security_struct\
