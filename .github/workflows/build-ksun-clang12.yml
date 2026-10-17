@@ -392,7 +392,7 @@ jobs:
         kernel/scripts/config --file kernel/out/.config \
           -e KSU -d KSU_DEBUG -d KSU_KPROBES_HOOK -d KSU_KPROBE_HOOKS \
           -d KSU_SYSCALL_TABLE_HOOK -d LTO -d LTO_CLANG -d THINLTO -e LTO_NONE
-        kernel/scripts/config --file kernel/out/.config --set-str LOCALVERSION 'Delaiya+' -d LOCALVERSION_AUTO
+        kernel/scripts/config --file kernel/out/.config --set-str LOCALVERSION '-Deliya+' -d LOCALVERSION_AUTO
         if grep -Eq '^[[:space:]]*config KSU_MANUAL_HOOK' kernel/KernelSU-Next/kernel/Kconfig; then
           kernel/scripts/config --file kernel/out/.config -e KSU_MANUAL_HOOK
         fi
